@@ -11,7 +11,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 
-from app.config import MODEL_VERSION, ARTIFACTS_DIR
+from app.config import MODEL_VERSION, ARTIFACTS_DIR, FEEDBACK_CSV, COLLECTED_SESSIONS_CSV, ACN_DATA_PATH
 from app.models.demand_forecast import load_demand_models, predict_demand
 from app.models.departure_prediction import load_departure_model, predict_departure
 from app.schemas import (
@@ -92,6 +92,7 @@ async def predict_departure_endpoint(request: DeparturePredictionRequest):
         cluster_id=request.cluster_id,
         user_mean_stay=request.user_historical_mean_stay_min,
         station_mean_stay=request.station_historical_mean_stay_min,
+        requested_energy_kwh=request.requested_energy_kwh,
     )
     return DeparturePredictionResponse(
         model_version=MODEL_VERSION,
@@ -134,8 +135,66 @@ async def model_metrics():
                     "is_weekend", "month_sin", "month_cos",
                     "site_encoded", "cluster_encoded",
                     "user_mean_stay", "station_mean_stay",
+                    "requested_energy_kwh",
                 ],
                 "description": "Predicts how long each EV will stay based on arrival patterns",
             },
         },
     }
+
+
+@app.get("/drift-status")
+async def drift_status(window: int = 200):
+    """
+    Return live model drift metrics computed from collected feedback data.
+
+    Compares rolling prediction error (MAE) and stay-duration distribution
+    shift (PSI) against the training baseline.  Use this to decide when to
+    trigger retraining.
+
+    Query param:
+      window (int, default 200) — number of recent sessions to compute rolling metrics over.
+    """
+    from training.drift_monitor import compute_drift_metrics
+    window = max(10, min(window, 2000))
+    return compute_drift_metrics(FEEDBACK_CSV, window=window)
+
+
+@app.post("/retrain")
+async def trigger_retrain(force: bool = False):
+    """
+    Trigger model retraining on collected live session data.
+
+    Retraining runs synchronously (may take 1-3 minutes).  The models are
+    hot-swapped in-memory after training completes.
+
+    Query param:
+      force (bool, default False) — retrain even if fewer than 500 new sessions.
+    """
+    global _demand_loaded, _departure_loaded
+    from training.retrain import run_retrain
+
+    result = run_retrain(
+        acn_data_path=ACN_DATA_PATH,
+        collected_path=COLLECTED_SESSIONS_CSV,
+        artifacts_dir=ARTIFACTS_DIR,
+        force=force,
+    )
+
+    if result.get("retrained"):
+        # Hot-reload the updated model files
+        try:
+            load_departure_model()
+            _departure_loaded = True
+            logger.info("Departure model hot-reloaded after retraining")
+        except Exception as e:
+            logger.error(f"Failed to reload departure model: {e}")
+
+        try:
+            load_demand_models()
+            _demand_loaded = True
+            logger.info("Demand model hot-reloaded after retraining")
+        except Exception as e:
+            logger.error(f"Failed to reload demand model: {e}")
+
+    return result

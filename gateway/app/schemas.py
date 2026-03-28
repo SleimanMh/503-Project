@@ -23,6 +23,9 @@ class SimulationRequest(BaseModel):
     simulation_duration_hours: float = Field(default=24.0, gt=0, le=168)
     time_step_minutes: int = Field(default=15, ge=5, le=60)
     compare_baseline: bool = Field(default=True, description="Also run FCFS baseline for comparison")
+    chargers_section_a: int = Field(default=10, ge=1, le=100, description="EV chargers in LV Section A")
+    chargers_section_b: int = Field(default=10, ge=1, le=100, description="EV chargers in LV Section B")
+    feeder_length_m: float = Field(default=30.0, gt=0, le=500, description="LV feeder cable length per section (metres)")
 
 
 class EVResult(BaseModel):
@@ -48,6 +51,8 @@ class GridMetrics(BaseModel):
     min_bus_voltage_pu: float
     overload_minutes: float
     warnings: list[str]
+    network_losses_kw: float = Field(default=0.0)
+    bus_voltages_pu: dict[str, float] = Field(default={})
 
 
 class MLMetrics(BaseModel):
@@ -57,7 +62,7 @@ class MLMetrics(BaseModel):
     demand_forecast_windows: int = Field(default=0, description="Future windows in ML demand forecast")
     capacity_reserved_kwh: float = Field(default=0, description="Total energy capacity reserved by ML forecast")
     avg_predicted_stay_min: Optional[float] = Field(default=None, description="Mean ML-predicted stay duration")
-    default_stay_min: float = Field(default=240, description="Fixed stay used by no-ML baseline")
+    default_stay_min: float = Field(default=340.9, description="ACN per-hour mean used by no-ML baseline (overall average)")
 
 
 class StrategyResult(BaseModel):

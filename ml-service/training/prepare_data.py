@@ -131,6 +131,13 @@ def build_departure_dataset(df: pd.DataFrame) -> pd.DataFrame:
     )
     df["station_mean_stay"] = df["station_mean_stay"].fillna(df["duration_min"].mean())
 
+    # Energy requested — available at arrival time; strong proxy for stay duration
+    # (more kWh needed → vehicle stays longer to charge)
+    if "kwh_delivered" in df.columns:
+        df["requested_energy_kwh"] = df["kwh_delivered"]
+    else:
+        df["requested_energy_kwh"] = 9.0  # ACN dataset mean as fallback
+
     # Target
     df["target_duration_min"] = df["duration_min"]
 
@@ -142,6 +149,7 @@ DEPARTURE_FEATURE_COLS = [
     "month_sin", "month_cos",
     "site_encoded", "cluster_encoded",
     "user_mean_stay", "station_mean_stay",
+    "requested_energy_kwh",
 ]
 
 DEPARTURE_TARGET_COL = "target_duration_min"

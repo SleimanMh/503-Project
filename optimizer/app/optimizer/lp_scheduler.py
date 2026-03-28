@@ -3,12 +3,21 @@ LP-based power allocation scheduler.
 
 Solves the charging optimization problem from SYSTEM_DESIGN.md Section 5:
 
-  maximize  Σ_i Σ_k  w_i · x_{i,k} · Δt
+  maximize  Σ_i Σ_k  w_i · decay_k · x_{i,k} · Δt
   subject to:
       Σ_i x_{i,k}  ≤  P_max - base_load_k - reserved_k   for each slot k
       0 ≤ x_{i,k}  ≤  p_i^max                             for each (i,k)
       Σ_k x_{i,k} · Δt  ≤  e_i                            for each vehicle i
+      Σ_k x_{i,k} · Δt  ≥  min_guarantee_i                for each vehicle i
       x_{i,k} = 0  if vehicle i is not present in slot k
+
+Key features:
+  - FRONT-LOADING: earlier slots in a vehicle's window get higher weight,
+    so the LP delivers energy quickly and is robust to early departure.
+  - MINIMUM GUARANTEE: every vehicle is guaranteed at least MIN_SAT_PCT
+    of its requested energy (or its physical max if constrained).
+  - MAX-MIN FAIRNESS: Phase 2 maximises the worst-off vehicle's
+    satisfaction so no customer is neglected.
 
 When ML predictions are provided, reserved_k is computed from predicted
 future EV arrivals — the optimizer saves capacity for vehicles that haven't
@@ -21,6 +30,11 @@ import numpy as np
 from scipy.optimize import linprog
 
 from app.schemas import EVVehicle, EVSchedule, FutureArrival
+
+# Every vehicle is guaranteed at least this fraction of its requested energy
+# (or its physical maximum if the stay is too short).  This prevents any
+# customer from leaving with nearly zero charge.
+MIN_SAT_FRACTION = 0.20  # 20% minimum guarantee
 
 
 def _build_reservation_profile(
@@ -67,8 +81,18 @@ def optimize_schedule(
     predicted_future_arrivals: list[FutureArrival] | None = None,
 ) -> list[EVSchedule]:
     """
-    Solve the LP to maximize total energy delivered across all vehicles,
-    weighted by urgency (vehicles with tighter deadlines get priority).
+    Two-phase LP for fair, front-loaded energy allocation:
+
+    Phase 1 — maximize total energy delivered (urgency-weighted) with
+              a FRONT-LOADING decay so earlier slots are preferred.
+              Also enforces a MINIMUM GUARANTEE for every vehicle.
+    Phase 2 — constrain total ≥ 95% of E*, then maximise the worst-off
+              vehicle's satisfaction (max-min fairness).
+
+    Front-loading rationale: ML may predict a 10-hour stay, but the vehicle
+    might leave after 3 hours.  By delivering energy early, the system is
+    robust against departure uncertainty.  The decay factor gives the first
+    slot in a vehicle's window weight 1.0, and the last slot weight ~0.3.
     """
     n_vehicles = len(vehicles)
     n_vars = n_vehicles * num_slots  # x_{i,k} for each vehicle × slot
@@ -80,41 +104,39 @@ def optimize_schedule(
         end = min(num_slots, v.departure_slot)
         presence[i, start:end] = True
 
-    # ── Objective: maximize Σ w_i · x_{i,k} · Δt ──
-    # Mild urgency bonus gives priority to time-constrained vehicles
-    # without creating extreme distribution bias.
-    weights = np.zeros(n_vars)
+    # ── Front-loading decay per vehicle ──────────────────────────────────
+    # For each vehicle, slots closer to arrival get higher weight.
+    # decay(k) = 1.0 - 0.7 * (k - arrival) / (departure - arrival - 1)
+    # This means: first slot = 1.0, last slot = 0.3
+    DECAY_MIN = 0.3
+    decay = np.ones((n_vehicles, num_slots))
     for i, v in enumerate(vehicles):
-        available_slots = max(1, presence[i].sum())
-        urgency = v.energy_needed_kwh / (available_slots * slot_duration_hours * v.max_charge_kw + 1e-6)
-        w = 1.0 + 0.5 * urgency
-        for k in range(num_slots):
-            weights[i * num_slots + k] = w * slot_duration_hours if presence[i, k] else 0
-
-    # linprog minimizes, so negate for maximization
-    c = -weights
+        start = max(0, v.arrival_slot)
+        end = min(num_slots, v.departure_slot)
+        window = end - start
+        if window > 1:
+            for k in range(start, end):
+                progress = (k - start) / (window - 1)
+                decay[i, k] = 1.0 - (1.0 - DECAY_MIN) * progress
 
     # ── ML Reservation: capacity reserved for predicted future arrivals ──
-    # Reserve a FRACTION of predicted demand (not 100%) to balance current vs future.
-    # Also cap reservation so current vehicles always get at least 50% of available capacity.
-    RESERVATION_FRACTION = 0.10  # reserve 10% of predicted demand
+    RESERVATION_FRACTION = 0.10
     if predicted_future_arrivals:
         reserved = _build_reservation_profile(
             predicted_future_arrivals, num_slots, slot_duration_hours
         )
         reserved *= RESERVATION_FRACTION
-        # Cap: never reserve more than 50% of available capacity per slot
         for k in range(num_slots):
             headroom = transformer_capacity_kw - base_load_per_slot_kw[k]
             reserved[k] = min(reserved[k], 0.5 * max(0, headroom))
     else:
         reserved = np.zeros(num_slots)
 
-    # ── Constraints ──
+    # ── Shared constraint matrices ──
     A_ub_rows = []
     b_ub_vals = []
 
-    # 1) Per-slot capacity: Σ_i x_{i,k} ≤ P_available_k - reserved_k
+    # 1) Per-slot capacity: Σ_i x_{i,k} ≤ P_available_k
     for k in range(num_slots):
         row = np.zeros(n_vars)
         for i in range(n_vehicles):
@@ -133,6 +155,24 @@ def optimize_schedule(
         A_ub_rows.append(row)
         b_ub_vals.append(v.energy_needed_kwh)
 
+    # 3) Minimum energy guarantee: Σ_k x_{i,k} · Δt ≥ min_guarantee_i
+    #    → rewrite as: −Σ_k x_{i,k} · Δt ≤ −min_guarantee_i
+    #    The guarantee is MIN_SAT_FRACTION of needed energy, capped at
+    #    what the vehicle can physically receive in its window.
+    min_guarantees = []
+    for i, v in enumerate(vehicles):
+        max_e = float(presence[i].sum()) * slot_duration_hours * v.max_charge_kw
+        physical_max = min(max_e, v.energy_needed_kwh)
+        guarantee = min(MIN_SAT_FRACTION * v.energy_needed_kwh, physical_max)
+        min_guarantees.append(guarantee)
+
+        row = np.zeros(n_vars)
+        for k in range(num_slots):
+            if presence[i, k]:
+                row[i * num_slots + k] = -slot_duration_hours
+        A_ub_rows.append(row)
+        b_ub_vals.append(-guarantee)
+
     A_ub = np.array(A_ub_rows)
     b_ub = np.array(b_ub_vals)
 
@@ -145,18 +185,109 @@ def optimize_schedule(
             else:
                 bounds.append((0, 0))
 
-    # ── Solve ──
-    # Use interior-point (barrier) method to get the analytic centre of optimal
-    # solutions.  Simplex returns a vertex which can be highly unequal when the
-    # LP has many equivalent optima (degenerate).  Interior-point produces a
-    # balanced allocation that promotes proportional fairness.
-    result = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method="highs-ipm")
+    # ════════════════════════════════════════════════════════════════
+    #  PHASE 1 — maximise total energy (urgency + front-loading)
+    #  Urgency capped at 2.0 so time-critical vehicles are prioritised
+    #  but not at the total expense of others.
+    #  Front-loading decay ensures energy is delivered early in the
+    #  vehicle's stay, making the schedule robust to early departure.
+    # ════════════════════════════════════════════════════════════════
+    w1 = np.zeros(n_vars)
+    for i, v in enumerate(vehicles):
+        available_slots = max(1, presence[i].sum())
+        urgency = v.energy_needed_kwh / (available_slots * slot_duration_hours * v.max_charge_kw + 1e-6)
+        urgency = min(urgency, 2.0)
+        w = 1.0 + 0.5 * urgency
+        for k in range(num_slots):
+            w1[i * num_slots + k] = w * decay[i, k] * slot_duration_hours if presence[i, k] else 0
 
-    if not result.success:
-        # Fallback: return zero allocation (optimizer couldn't find solution)
+    r1 = linprog(-w1, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method="highs-ipm")
+    if not r1.success:
         return _zero_schedules(vehicles, num_slots)
 
-    x = result.x.reshape(n_vehicles, num_slots)
+    best_total_energy = -r1.fun  # maximised value from phase 1
+
+    # ════════════════════════════════════════════════════════════════
+    #  PHASE 2 — max-min fairness
+    #  Introduce a scalar variable t = minimum satisfaction fraction.
+    #  Maximize t so the worst-off vehicle is as well-off as possible.
+    #  This eliminates 0% allocations and produces realistic intermediate
+    #  values (e.g. 47%, 63%, 81%) instead of 100%/0% extremes.
+    #
+    #  Augmented variable vector: [x_{0,0} ... x_{n-1,T-1}, t]
+    #
+    #  Constraints added:
+    #    sat_i ≥ t  →  −Σ_k x_{i,k}·Δt/e_i + t ≤ 0   (for each vehicle)
+    #    total energy ≥ 95% of E*                       (efficiency floor)
+    #    t ≤ 1.0                                        (cap at full charge)
+    #
+    #  Vehicles physically unable to reach 10% satisfaction (e.g. ML
+    #  predicted a 15-min stay for a 50 kWh battery) are excluded from
+    #  the min-sat constraint so they don't drag t to ~0% for the fleet.
+    # ════════════════════════════════════════════════════════════════
+
+    # Per-vehicle physical ceiling within their presence window
+    max_achievable = []
+    for i, v in enumerate(vehicles):
+        max_e = float(presence[i].sum()) * slot_duration_hours * v.max_charge_kw
+        max_achievable.append(min(max_e, v.energy_needed_kwh))
+
+    n_p2 = n_vars + 1                    # t is the last variable
+    c_p2 = np.zeros(n_p2)
+    c_p2[-1] = -1.0                      # maximize t (minimize −t)
+    # Add small front-loading bonus to Phase 2 so the fairness solution
+    # also prefers early delivery (tie-breaking when many solutions have
+    # the same t value)
+    for i, v in enumerate(vehicles):
+        for k in range(num_slots):
+            if presence[i, k]:
+                c_p2[i * num_slots + k] = -1e-4 * decay[i, k]
+
+    A_p2_rows, b_p2_vals = [], []
+
+    # (a) Capacity + energy-cap constraints — same as Phase 1, t column = 0
+    for row, bval in zip(A_ub_rows, b_ub_vals):
+        A_p2_rows.append(np.append(row, 0.0))
+        b_p2_vals.append(bval)
+
+    # (b) sat_i ≥ t  for vehicles that can realistically be served
+    for i, v in enumerate(vehicles):
+        phys_sat = max_achievable[i] / v.energy_needed_kwh if v.energy_needed_kwh > 0 else 1.0
+        if phys_sat < 0.10:          # skip physically-constrained vehicles
+            continue
+        row = np.zeros(n_p2)
+        for k in range(num_slots):
+            if presence[i, k]:
+                row[i * num_slots + k] = -slot_duration_hours / v.energy_needed_kwh
+        row[-1] = 1.0                # + t
+        A_p2_rows.append(row)
+        b_p2_vals.append(0.0)
+
+    # (c) Total energy floor: −Σ x·Δt ≤ −0.95·E*
+    tot = np.zeros(n_p2)
+    for i in range(n_vehicles):
+        for k in range(num_slots):
+            if presence[i, k]:
+                tot[i * num_slots + k] = slot_duration_hours
+    A_p2_rows.append(-tot)
+    b_p2_vals.append(-0.95 * best_total_energy)
+
+    # (d) t ≤ 1.0
+    row_t = np.zeros(n_p2)
+    row_t[-1] = 1.0
+    A_p2_rows.append(row_t)
+    b_p2_vals.append(1.0)
+
+    bounds_p2 = bounds + [(0.0, 1.0)]    # t ∈ [0, 1]
+
+    r2 = linprog(
+        c_p2,
+        A_ub=np.array(A_p2_rows), b_ub=np.array(b_p2_vals),
+        bounds=bounds_p2, method="highs-ipm",
+    )
+
+    # Use phase-2 result if feasible, fall back to phase-1
+    x = (r2.x[:n_vars] if r2.success else r1.x).reshape(n_vehicles, num_slots)
 
     # ── Build response ──
     schedules = []

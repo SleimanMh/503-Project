@@ -52,7 +52,14 @@ class GridValidationRequest(BaseModel):
     total_load_per_slot_kw: list[float]
     transformer_capacity_kw: float
     num_charger_nodes: int = Field(default=20)
+    chargers_section_a: int = Field(default=10, ge=1, le=100, description="EV chargers in Section A")
+    chargers_section_b: int = Field(default=10, ge=1, le=100, description="EV chargers in Section B")
     transformer_kva: float = Field(default=500.0)
+    base_load_per_slot_kw: list[float] = Field(
+        default=[],
+        description="Building base load per slot (kW) — separates EV load from building load for OpenDSS network assignment",
+    )
+    feeder_length_m: float = Field(default=30.0, gt=0, le=500, description="LV feeder cable length per section (metres)")
 
 
 class GridValidationResponse(BaseModel):
@@ -62,3 +69,5 @@ class GridValidationResponse(BaseModel):
     max_line_current_a: float
     overload_minutes: float
     warnings: list[str]
+    network_losses_kw: float = Field(default=0.0, description="Total I²R losses in LV feeders + transformer copper/iron losses (kW)")
+    bus_voltages_pu: dict[str, float] = Field(default={}, description="Per-bus voltage magnitude in p.u. from AC power flow")

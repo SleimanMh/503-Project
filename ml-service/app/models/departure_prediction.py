@@ -33,6 +33,7 @@ def predict_departure(
     cluster_id: str = "0039",
     user_mean_stay: float | None = None,
     station_mean_stay: float | None = None,
+    requested_energy_kwh: float | None = None,
 ) -> dict:
     """
     Predict how long a vehicle will stay given arrival context.
@@ -65,12 +66,16 @@ def predict_departure(
         user_mean_stay = 300.0  # ~5 hours default
     if station_mean_stay is None:
         station_mean_stay = 300.0
+    # Use 9 kWh as a neutral default (ACN dataset mean) when unknown
+    if requested_energy_kwh is None:
+        requested_energy_kwh = 9.0
 
     features = np.array([[
         hour_sin, hour_cos, dow_sin, dow_cos, is_weekend,
         month_sin, month_cos,
         site_encoded, cluster_encoded,
         user_mean_stay, station_mean_stay,
+        requested_energy_kwh,
     ]])
 
     predicted_min = float(_model.predict(features)[0])

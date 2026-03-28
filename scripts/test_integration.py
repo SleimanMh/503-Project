@@ -102,7 +102,13 @@ def print_results(label, d):
                 print(f"  ⚠ {w}")
 
 
-now = datetime.now(timezone.utc)
+# Pin arrival time to 09:00 UTC so ML departure predictions are deterministic
+# (the XGBoost model uses arrival_hour as a feature; varying wall-clock time
+#  causes predictions — and therefore ML impact — to change between runs)
+# Use yesterday's 09:00 UTC if today's hasn't passed yet, so it's always in the past.
+now = datetime.now(timezone.utc).replace(hour=9, minute=0, second=0, microsecond=0)
+if now > datetime.now(timezone.utc):
+    now -= timedelta(days=1)
 
 # ════════════════════════════════════════════════════════════════
 #  SCENARIO 1: ML Departure Prediction — Heavy Contention
@@ -115,14 +121,38 @@ now = datetime.now(timezone.utc)
 # ════════════════════════════════════════════════════════════════
 print("\n\n▶ SCENARIO 1: ML Departure Prediction (20 EVs, all arriving at once)")
 
+# Realistic fleet: varied SoC (morning arrivals), varied car models
+_S1_PROFILES = [
+    (40, 95, 7.2,  40),  # Nissan Leaf, low SoC commuter
+    (22, 90, 11.0, 50),  # Renault Zoe
+    (18, 85, 11.0, 60),  # Tesla Model 3 SR
+    (35, 90, 11.0, 75),  # Tesla Model 3 LR
+    (12, 80, 7.2,  40),  # BMW i3, nearly empty
+    (50, 90, 11.0, 58),  # VW ID.3, half-full
+    (28, 85, 11.0, 77),  # VW ID.4
+    (45, 95, 22.0, 72),  # Hyundai Ioniq 5, fast charger
+    (10, 80, 22.0, 77),  # Kia EV6, very low SoC
+    (33, 90, 11.0, 75),  # Tesla Model Y
+    (55, 85, 22.0, 95),  # Audi e-tron, high capacity
+    (20, 90, 7.2,  50),  # Peugeot e-208
+    (15, 85, 11.0, 77),  # Skoda Enyaq
+    (42, 95, 7.2,  33),  # Mini Electric, small battery
+    (30, 90, 11.0, 80),  # Mercedes EQC
+    (8,  80, 7.2,  40),  # Nissan Leaf, nearly empty
+    (25, 85, 11.0, 60),  # Tesla Model 3 SR
+    (48, 90, 22.0, 72),  # Hyundai Ioniq 5
+    (16, 95, 11.0, 50),  # Renault Zoe, urgent charge
+    (38, 85, 11.0, 75),  # Tesla Model 3 LR
+]
 vehicles_s1 = []
 for i in range(20):
+    soc, tgt, kw, cap = _S1_PROFILES[i]
     vehicles_s1.append({
         "ev_id": f"EV-{i+1:03d}",
-        "battery_pct": 15 + (i * 3) % 25,
-        "target_pct": 85 + (i % 3) * 5,
-        "max_charge_kw": 7.2,
-        "battery_capacity_kwh": [50, 60, 75][i % 3],
+        "battery_pct": soc,
+        "target_pct": tgt,
+        "max_charge_kw": kw,
+        "battery_capacity_kwh": cap,
         "arrival_time": now.isoformat(),  # ALL arrive at once
         # NO planned_departure_time → ML departure prediction kicks in!
     })
@@ -153,15 +183,44 @@ print_results("SCENARIO 1: ML Departure Prediction — AI+ML should beat AI-only
 # ════════════════════════════════════════════════════════════════
 print("\n\n▶ SCENARIO 2: Heavy contention (25 EVs, 100 kW transformer, no departures)")
 
+# Staggered arrivals over 3 hours — office workers arriving through the morning
+_S2_DATA = [
+    #  soc  tgt    kw    cap  arrival_offset_min
+    (  12,  90,   7.2,   40,   0),
+    (  28,  85,  11.0,   60,   5),
+    (  45,  90,  11.0,   75,   8),
+    (  10,  80,  22.0,   77,  10),
+    (  33,  95,   7.2,   50,  15),
+    (  18,  85,  11.0,   58,  18),
+    (  52,  90,  22.0,   72,  20),
+    (  22,  80,  11.0,   77,  25),
+    (   8,  90,   7.2,   40,  28),
+    (  40,  85,  11.0,   60,  30),
+    (  15,  95,  11.0,   75,  35),
+    (  35,  80,  22.0,   95,  38),
+    (  20,  90,   7.2,   33,  40),
+    (  48,  85,  11.0,   80,  45),
+    (  25,  90,   7.2,   40,  48),
+    (  11,  80,  11.0,   50,  50),
+    (  37,  90,  22.0,   72,  55),
+    (  55,  85,  11.0,   75,  58),
+    (  14,  95,   7.2,   40,  60),
+    (  30,  80,  11.0,   60,  65),
+    (  42,  90,  11.0,   77,  70),
+    (   9,  85,  22.0,   77,  75),
+    (  26,  90,   7.2,   50,  80),
+    (  50,  80,  11.0,   58,  85),
+    (  17,  95,  11.0,   75,  90),
+]
 vehicles_s2 = []
-for i in range(25):
-    arrival = now + timedelta(minutes=i * 8)
+for i, (soc, tgt, kw, cap, offset) in enumerate(_S2_DATA):
+    arrival = now + timedelta(minutes=offset)
     vehicles_s2.append({
         "ev_id": f"HEAVY-{i+1:02d}",
-        "battery_pct": 10 + (i * 5) % 35,
-        "target_pct": 80 + (i % 4) * 5,
-        "max_charge_kw": [7.2, 7.2, 11.0, 7.2, 22.0][i % 5],
-        "battery_capacity_kwh": [50, 60, 60, 75, 40][i % 5],
+        "battery_pct": soc,
+        "target_pct": tgt,
+        "max_charge_kw": kw,
+        "battery_capacity_kwh": cap,
         "arrival_time": arrival.isoformat(),
         # NO planned_departure_time
     })
@@ -192,28 +251,54 @@ print("\n\n▶ SCENARIO 3: Mixed (8 known departures + 12 ML-predicted)")
 
 vehicles_s3 = []
 
-# 8 EVs WITH planned departures (urgent, 2h window)
-for i in range(8):
-    arrival = now + timedelta(minutes=i * 5)
+# 8 EVs WITH planned departures — short-stay visitors (1.5–3 h window, urgent)
+_S3_KNOWN = [
+    # soc  tgt    kw   cap  arrive_min  stay_hr
+    ( 15,  80,   7.2,  40,   0,         1.5),
+    ( 30,  90,  11.0,  60,   5,         2.0),
+    ( 22,  85,   7.2,  50,  10,         2.5),
+    ( 45,  90,  11.0,  75,  12,         1.5),
+    ( 10,  80,  22.0,  77,  15,         2.0),
+    ( 38,  95,  11.0,  58,  18,         3.0),
+    ( 20,  85,   7.2,  40,  20,         1.5),
+    ( 50,  90,  11.0,  72,  25,         2.0),
+]
+for i, (soc, tgt, kw, cap, off, stay) in enumerate(_S3_KNOWN):
+    arrival = now + timedelta(minutes=off)
     vehicles_s3.append({
         "ev_id": f"KNOWN-{i+1:02d}",
-        "battery_pct": 20,
-        "target_pct": 90,
-        "max_charge_kw": 7.2,
-        "battery_capacity_kwh": 60,
+        "battery_pct": soc,
+        "target_pct": tgt,
+        "max_charge_kw": kw,
+        "battery_capacity_kwh": cap,
         "arrival_time": arrival.isoformat(),
-        "planned_departure_time": (arrival + timedelta(hours=2)).isoformat(),
+        "planned_departure_time": (arrival + timedelta(hours=stay)).isoformat(),
     })
 
-# 12 EVs WITHOUT planned departures (ML predicts)
-for i in range(12):
-    arrival = now + timedelta(minutes=30 + i * 10)
+# 12 EVs WITHOUT planned departures — all-day parkers (ML predicts)
+_S3_UNKNOWN = [
+    # soc  tgt    kw   cap  arrive_min
+    ( 18,  90,  11.0,  60,  30),
+    ( 35,  85,  22.0,  77,  35),
+    ( 12,  80,   7.2,  40,  40),
+    ( 48,  90,  11.0,  75,  45),
+    ( 25,  95,  11.0,  58,  50),
+    ( 42,  85,  22.0,  95,  55),
+    ( 16,  80,   7.2,  50,  60),
+    ( 55,  90,  11.0,  80,  65),
+    ( 28,  85,  11.0,  77,  70),
+    (  9,  90,  22.0,  72,  75),
+    ( 34,  80,   7.2,  33,  80),
+    ( 44,  95,  11.0,  60,  90),
+]
+for i, (soc, tgt, kw, cap, off) in enumerate(_S3_UNKNOWN):
+    arrival = now + timedelta(minutes=off)
     vehicles_s3.append({
         "ev_id": f"UNKNOWN-{i+1:02d}",
-        "battery_pct": 25 + (i * 4) % 20,
-        "target_pct": 85,
-        "max_charge_kw": [7.2, 11.0][i % 2],
-        "battery_capacity_kwh": [50, 60, 75][i % 3],
+        "battery_pct": soc,
+        "target_pct": tgt,
+        "max_charge_kw": kw,
+        "battery_capacity_kwh": cap,
         "arrival_time": arrival.isoformat(),
         # NO planned_departure_time → ML predicts
     })

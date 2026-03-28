@@ -36,7 +36,8 @@
     "site_encoded",
     "cluster_encoded",
     "user_mean_stay",
-    "station_mean_stay"
+    "station_mean_stay",
+    "requested_energy_kwh"
   ],
   "demand_split": {
     "train": 18084,

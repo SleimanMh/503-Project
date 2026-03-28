@@ -32,7 +32,10 @@ class DeparturePredictionRequest(BaseModel):
     cluster_id: str = Field(default="0039")
     user_historical_mean_stay_min: Optional[float] = Field(default=None)
     station_historical_mean_stay_min: Optional[float] = Field(default=None)
-
+    requested_energy_kwh: Optional[float] = Field(
+        default=None,
+        description="Energy needed by the vehicle (kWh). Strong predictor of stay duration.",
+    )
 
 class DeparturePredictionResponse(BaseModel):
     model_version: str

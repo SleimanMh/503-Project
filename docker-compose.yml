@@ -9,9 +9,12 @@ services:
     ports:
       - "8000:8000"   # API Gateway
       - "8501:8501"   # Streamlit Dashboard
+    volumes:
+      - ./data:/app/data
     environment:
       - ML_SERVICE_URL=http://ml-service:8001
       - OPTIMIZER_SERVICE_URL=http://optimizer:8002
+      - DATA_DIR=/app/data
     networks:
       - internal
     depends_on:
@@ -25,6 +28,12 @@ services:
   ml-service:
     build: ./ml-service
     # No ports exposed to host — internal only
+    volumes:
+      - ./data:/app/data
+      - ./ml-service/artifacts:/app/artifacts
+    environment:
+      - DATA_DIR=/app/data
+      - ACN_DATA_PATH=/app/data/acn_sessions.csv
     networks:
       - internal
     restart: unless-stopped

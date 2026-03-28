@@ -9,3 +9,5 @@ venv/
 .pytest_cache/
 mlruns/
 *.parquet
+*.log
+logs/
