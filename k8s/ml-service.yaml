@@ -1,0 +1,80 @@
+# ML Service — Departure Prediction + Demand Forecasting (Container 2)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ml-service
+  namespace: ev-charging
+  labels:
+    app: ml-service
+    app.kubernetes.io/part-of: ev-charging-optimizer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ml-service
+  template:
+    metadata:
+      labels:
+        app: ml-service
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8001"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: ml-service
+          image: proj-test-ml-service:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8001
+              name: http
+          envFrom:
+            - configMapRef:
+                name: ev-charging-config
+          volumeMounts:
+            - name: shared-data
+              mountPath: /app/data
+            - name: ml-artifacts
+              mountPath: /app/artifacts
+          resources:
+            requests:
+              cpu: 200m
+              memory: 192Mi
+            limits:
+              cpu: 1000m
+              memory: 384Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8001
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8001
+            initialDelaySeconds: 15
+            periodSeconds: 30
+      volumes:
+        - name: shared-data
+          persistentVolumeClaim:
+            claimName: shared-data-pvc
+        - name: ml-artifacts
+          persistentVolumeClaim:
+            claimName: ml-artifacts-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ml-service
+  namespace: ev-charging
+  labels:
+    app: ml-service
+spec:
+  type: ClusterIP
+  selector:
+    app: ml-service
+  ports:
+    - name: http
+      port: 8001
+      targetPort: 8001

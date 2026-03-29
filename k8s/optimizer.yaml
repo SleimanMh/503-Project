@@ -1,0 +1,65 @@
+# Optimizer — LP Scheduler + FCFS Baseline + Grid Validation (Container 3)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: optimizer
+  namespace: ev-charging
+  labels:
+    app: optimizer
+    app.kubernetes.io/part-of: ev-charging-optimizer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: optimizer
+  template:
+    metadata:
+      labels:
+        app: optimizer
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8002"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: optimizer
+          image: proj-test-optimizer:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8002
+              name: http
+          resources:
+            requests:
+              cpu: 200m
+              memory: 128Mi
+            limits:
+              cpu: 1000m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8002
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8002
+            initialDelaySeconds: 15
+            periodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: optimizer
+  namespace: ev-charging
+  labels:
+    app: optimizer
+spec:
+  type: ClusterIP
+  selector:
+    app: optimizer
+  ports:
+    - name: http
+      port: 8002
+      targetPort: 8002

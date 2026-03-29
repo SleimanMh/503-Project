@@ -1,0 +1,91 @@
+# Monitoring — Unified container (Prometheus + Grafana + MLflow)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: monitoring
+  namespace: ev-charging
+  labels:
+    app: monitoring
+    app.kubernetes.io/part-of: ev-charging-optimizer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: monitoring
+  template:
+    metadata:
+      labels:
+        app: monitoring
+    spec:
+      containers:
+        - name: monitoring
+          image: proj-test-monitoring:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 9090
+              name: prometheus
+            - containerPort: 3000
+              name: grafana
+            - containerPort: 5000
+              name: mlflow
+          volumeMounts:
+            - name: prometheus-data
+              mountPath: /prometheus
+            - name: grafana-data
+              mountPath: /var/lib/grafana
+            - name: mlflow-data
+              mountPath: /mlflow
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: 9090
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 15
+            periodSeconds: 30
+      volumes:
+        - name: prometheus-data
+          persistentVolumeClaim:
+            claimName: prometheus-data-pvc
+        - name: grafana-data
+          persistentVolumeClaim:
+            claimName: grafana-data-pvc
+        - name: mlflow-data
+          persistentVolumeClaim:
+            claimName: mlflow-data-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: monitoring
+  namespace: ev-charging
+  labels:
+    app: monitoring
+spec:
+  type: NodePort
+  selector:
+    app: monitoring
+  ports:
+    - name: prometheus
+      port: 9090
+      targetPort: 9090
+      nodePort: 30909
+    - name: grafana
+      port: 3000
+      targetPort: 3000
+      nodePort: 30300
+    - name: mlflow
+      port: 5000
+      targetPort: 5000
+      nodePort: 30500

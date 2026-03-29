@@ -1,5 +1,5 @@
 # EV Charging Optimization — Docker Compose
-# Architecture: 3 containers (1 external, 2 internal)
+# Architecture: 3 app containers + 1 monitoring container
 # See SYSTEM_DESIGN.md Section 3
 
 services:
@@ -27,13 +27,14 @@ services:
   # ── Container 2: ML Inference Service (INTERNAL) ──
   ml-service:
     build: ./ml-service
-    # No ports exposed to host — internal only
+    # No ports exposed to host — internal only (Prometheus scrapes via internal network)
     volumes:
       - ./data:/app/data
       - ./ml-service/artifacts:/app/artifacts
     environment:
       - DATA_DIR=/app/data
       - ACN_DATA_PATH=/app/data/acn_sessions.csv
+      - MLFLOW_TRACKING_URI=http://monitoring:5000
     networks:
       - internal
     restart: unless-stopped
@@ -45,6 +46,26 @@ services:
     networks:
       - internal
     restart: unless-stopped
+
+  # ── Container 4: Monitoring (Prometheus + Grafana + MLflow) ──
+  monitoring:
+    build: ./monitoring
+    ports:
+      - "9090:9090"   # Prometheus
+      - "3000:3000"   # Grafana
+      - "5000:5000"   # MLflow
+    volumes:
+      - prometheus_data:/prometheus
+      - grafana_data:/var/lib/grafana
+      - mlflow_data:/mlflow
+    networks:
+      - internal
+    restart: unless-stopped
+
+volumes:
+  prometheus_data:
+  grafana_data:
+  mlflow_data:
 
 networks:
   internal:

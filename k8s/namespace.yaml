@@ -1,0 +1,7 @@
+# Kubernetes namespace for the EV Charging Optimization System
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ev-charging
+  labels:
+    app.kubernetes.io/part-of: ev-charging-optimizer

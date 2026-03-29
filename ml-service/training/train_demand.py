@@ -17,6 +17,9 @@ import xgboost as xgb
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import TimeSeriesSplit
 
+import mlflow
+import mlflow.xgboost
+
 from training.prepare_data import DEMAND_FEATURE_COLS, DEMAND_TARGET_COLS
 
 
@@ -136,6 +139,36 @@ def train_demand_model(artifacts_dir: str = "artifacts/"):
 
     print(f"\nModels saved to {artifacts}/demand_model.pkl")
     print(f"Metrics saved to {artifacts}/demand_metrics.json")
+
+    # ── MLflow experiment tracking ──
+    mlflow.set_experiment("demand-forecasting")
+    with mlflow.start_run(run_name="demand-xgboost"):
+        # Log hyperparameters
+        mlflow.log_params({
+            "n_estimators": 300,
+            "max_depth": 5,
+            "learning_rate": 0.05,
+            "subsample": 0.8,
+            "colsample_bytree": 0.8,
+            "min_child_weight": 5,
+            "reg_alpha": 0.1,
+            "reg_lambda": 1.0,
+            "cv_splits": 5,
+        })
+        # Log metrics for each target
+        for target, m in metrics.items():
+            mlflow.log_metrics({
+                f"{target}_cv_mae_mean": m["cv_mae_mean"],
+                f"{target}_cv_mae_std": m["cv_mae_std"],
+                f"{target}_test_mae": m["test_mae"],
+                f"{target}_test_rmse": m["test_rmse"],
+                f"{target}_improvement_persistence_pct": m["improvement_over_persistence_pct"],
+                f"{target}_improvement_calendar_pct": m["improvement_over_calendar_pct"],
+            })
+        # Log model artifacts
+        mlflow.log_artifact(str(artifacts / "demand_model.pkl"))
+        mlflow.log_artifact(str(artifacts / "demand_metrics.json"))
+        print("MLflow: demand experiment logged.")
 
     # ── Check acceptance criteria ──
     arrival_mae = metrics["arrival_count"]["test_mae"]
