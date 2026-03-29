@@ -9,6 +9,8 @@ from contextlib import asynccontextmanager
 
 import numpy as np
 from fastapi import FastAPI
+from prometheus_fastapi_instrumentator import Instrumentator
+from prometheus_client import Histogram, Counter
 
 from app.schemas import (
     OptimizationRequest,
@@ -22,6 +24,19 @@ from app.grid.validator import validate_grid
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+# ── Prometheus custom metrics ────────────────────────────────────────────
+OPTIMIZATION_LATENCY = Histogram(
+    "optimizer_solve_seconds",
+    "Optimization solve latency in seconds",
+    ["strategy"],
+    buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0],
+)
+OPTIMIZATION_REQUESTS = Counter(
+    "optimizer_requests_total",
+    "Total optimization requests",
+    ["strategy"],
+)
 
 
 @asynccontextmanager
@@ -37,6 +52,9 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Prometheus auto-instrumentation — exposes /metrics
+Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=True)
+
 
 @app.get("/health")
 async def health():
@@ -46,6 +64,8 @@ async def health():
 @app.post("/optimize", response_model=OptimizationResponse)
 async def optimize(request: OptimizationRequest):
     """Run optimization with the chosen strategy (optimal, fcfs, or greedy)."""
+    import time as _time
+    t0 = _time.perf_counter()
 
     if request.strategy == "fcfs":
         schedules = fcfs_schedule(
@@ -65,6 +85,9 @@ async def optimize(request: OptimizationRequest):
             base_load_per_slot_kw=request.base_load_per_slot_kw,
             predicted_future_arrivals=request.predicted_future_arrivals or None,
         )
+
+    OPTIMIZATION_LATENCY.labels(strategy=request.strategy).observe(_time.perf_counter() - t0)
+    OPTIMIZATION_REQUESTS.labels(strategy=request.strategy).inc()
 
     # Compute aggregate metrics
     total_delivered = sum(s.energy_delivered_kwh for s in schedules)

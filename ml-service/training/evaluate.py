@@ -14,6 +14,8 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
+import mlflow
+
 from training.prepare_data import (
     DEMAND_FEATURE_COLS, DEMAND_TARGET_COLS,
     DEPARTURE_FEATURE_COLS, DEPARTURE_TARGET_COL,
@@ -83,6 +85,18 @@ def evaluate_models(artifacts_dir: str = "artifacts/"):
 
     with open(artifacts / "eval_report.json", "w") as f:
         json.dump(report, f, indent=2)
+
+    # ── MLflow: log evaluation results ──
+    mlflow.set_experiment("model-evaluation")
+    with mlflow.start_run(run_name="eval-report"):
+        eval_metrics = {k: v for k, v in report.items()
+                        if isinstance(v, (int, float))}
+        mlflow.log_metrics(eval_metrics)
+        mlflow.log_artifact(str(artifacts / "eval_report.json"))
+        mlflow.log_param("all_pass", report["all_pass"])
+        for check, passed in checks.items():
+            mlflow.log_param(check, passed)
+        print("MLflow: evaluation report logged.")
 
     print(f"\nReport saved to {artifacts}/eval_report.json")
     return report

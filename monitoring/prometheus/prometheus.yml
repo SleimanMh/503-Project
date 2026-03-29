@@ -1,0 +1,34 @@
+# Prometheus configuration for EV Charging Optimization System
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # ── Gateway (API + Dashboard) ──
+  - job_name: "gateway"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["gateway:8000"]
+        labels:
+          service: "gateway"
+
+  # ── ML Service (Departure Prediction + Demand Forecast) ──
+  - job_name: "ml-service"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["ml-service:8001"]
+        labels:
+          service: "ml-service"
+
+  # ── Optimizer (LP Scheduler + Grid Validation) ──
+  - job_name: "optimizer"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["optimizer:8002"]
+        labels:
+          service: "optimizer"
+
+  # ── Prometheus self-monitoring ──
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]

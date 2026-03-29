@@ -17,6 +17,9 @@ import xgboost as xgb
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import TimeSeriesSplit
 
+import mlflow
+import mlflow.xgboost
+
 from training.prepare_data import DEPARTURE_FEATURE_COLS, DEPARTURE_TARGET_COL
 
 
@@ -136,6 +139,33 @@ def train_departure_model(artifacts_dir: str = "artifacts/"):
 
     print(f"\nModel saved to {artifacts}/departure_model.pkl")
     print(f"Metrics saved to {artifacts}/departure_metrics.json")
+
+    # ── MLflow experiment tracking ──
+    mlflow.set_experiment("departure-prediction")
+    with mlflow.start_run(run_name="departure-xgboost"):
+        mlflow.log_params({
+            "n_estimators": 400,
+            "max_depth": 6,
+            "learning_rate": 0.05,
+            "subsample": 0.8,
+            "colsample_bytree": 0.8,
+            "min_child_weight": 5,
+            "reg_alpha": 0.1,
+            "reg_lambda": 1.0,
+            "cv_splits": 5,
+        })
+        mlflow.log_metrics({
+            "cv_mae_mean_min": metrics["cv_mae_mean_min"],
+            "cv_mae_std_min": metrics["cv_mae_std_min"],
+            "test_mae_min": metrics["test_mae_min"],
+            "test_rmse_min": metrics["test_rmse_min"],
+            "within_15min_pct": metrics["within_15min_pct"],
+            "within_30min_pct": metrics["within_30min_pct"],
+            "improvement_over_fixed4h_pct": metrics["improvement_over_fixed4h_pct"],
+        })
+        mlflow.log_artifact(str(artifacts / "departure_model.pkl"))
+        mlflow.log_artifact(str(artifacts / "departure_metrics.json"))
+        print("MLflow: departure experiment logged.")
 
     # ── Acceptance check ──
     print(f"\n{'='*60}")

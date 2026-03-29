@@ -33,6 +33,8 @@ import xgboost as xgb
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import TimeSeriesSplit
 
+import mlflow
+
 from training.prepare_data import (
     build_demand_dataset,
     build_departure_dataset,
@@ -289,6 +291,30 @@ def run_retrain(
     archive_path = collected_path.parent / f"collected_sessions_processed_{ts}.csv"
     shutil.move(str(collected_path), str(archive_path))
     logger.info(f"Archived processed sessions to {archive_path}")
+
+    # ── MLflow: log retraining run ────────────────────────────────────────
+    mlflow.set_experiment("model-retraining")
+    with mlflow.start_run(run_name=f"retrain-{ts}"):
+        mlflow.log_params({
+            "new_sessions": new_sessions,
+            "total_sessions_used": len(merged),
+            "retrain_trigger": "forced" if new_sessions < RETRAIN_THRESHOLD else "threshold",
+        })
+        mlflow.log_metrics({
+            "departure_test_mae_min": dep_metrics["test_mae_min"],
+            "departure_test_rmse_min": dep_metrics["test_rmse_min"],
+            "departure_within_15min_pct": dep_metrics["within_15min_pct"],
+        })
+        for target, m_metrics in demand_metrics.items():
+            mlflow.log_metrics({
+                f"demand_{target}_test_mae": m_metrics["test_mae"],
+                f"demand_{target}_test_rmse": m_metrics["test_rmse"],
+            })
+        mlflow.log_artifact(str(artifacts_dir / "eval_report.json"))
+        mlflow.log_artifact(str(artifacts_dir / "departure_model.pkl"))
+        mlflow.log_artifact(str(artifacts_dir / "demand_model.pkl"))
+        logger.info("MLflow: retraining run logged.")
+
     logger.info("Retraining complete.")
 
     return {

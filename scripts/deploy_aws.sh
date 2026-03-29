@@ -30,10 +30,13 @@ SG_ID=$(aws ec2 create-security-group \
     --region "$REGION" \
     --query 'SecurityGroups[0].GroupId' --output text)
 
-# Allow SSH, API, Dashboard
+# Allow SSH, API, Dashboard, Prometheus, Grafana
 aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --protocol tcp --port 22 --cidr 0.0.0.0/0 --region "$REGION" 2>/dev/null || true
 aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --protocol tcp --port 8000 --cidr 0.0.0.0/0 --region "$REGION" 2>/dev/null || true
 aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --protocol tcp --port 8501 --cidr 0.0.0.0/0 --region "$REGION" 2>/dev/null || true
+aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --protocol tcp --port 9090 --cidr 0.0.0.0/0 --region "$REGION" 2>/dev/null || true
+aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --protocol tcp --port 3000 --cidr 0.0.0.0/0 --region "$REGION" 2>/dev/null || true
+aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --protocol tcp --port 5000 --cidr 0.0.0.0/0 --region "$REGION" 2>/dev/null || true
 
 echo "  Security group: $SG_ID"
 
@@ -101,6 +104,8 @@ echo "     ssh -i ${KEY_NAME}.pem ec2-user@${PUBLIC_IP}"
 echo "     cd ~/ev-charging && docker-compose up -d --build"
 echo ""
 echo "  3. Access your system:"
-echo "     API:       http://${PUBLIC_IP}:8000"
-echo "     Dashboard: http://${PUBLIC_IP}:8501"
-echo "     API Docs:  http://${PUBLIC_IP}:8000/docs"
+echo "     API:        http://${PUBLIC_IP}:8000"
+echo "     Dashboard:  http://${PUBLIC_IP}:8501"
+echo "     API Docs:   http://${PUBLIC_IP}:8000/docs"
+echo "     Prometheus: http://${PUBLIC_IP}:9090"
+echo "     Grafana:    http://${PUBLIC_IP}:3000  (admin / evcharging)"

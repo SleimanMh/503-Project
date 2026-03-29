@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI
+from prometheus_fastapi_instrumentator import Instrumentator
 
 from app.config import ML_SERVICE_URL, OPTIMIZER_SERVICE_URL
 from app.routers.simulation import router as simulation_router
@@ -35,6 +36,9 @@ app = FastAPI(
 
 app.include_router(simulation_router)
 app.include_router(ml_monitoring_router)
+
+# Prometheus metrics — exposes /metrics endpoint
+Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=True)
 
 
 @app.get("/health")

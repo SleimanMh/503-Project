@@ -1,0 +1,16 @@
+# Shared configuration for all EV Charging services
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ev-charging-config
+  namespace: ev-charging
+  labels:
+    app.kubernetes.io/part-of: ev-charging-optimizer
+data:
+  ML_SERVICE_URL: "http://ml-service:8001"
+  OPTIMIZER_SERVICE_URL: "http://optimizer:8002"
+  MLFLOW_TRACKING_URI: "http://monitoring:5000"
+  DATA_DIR: "/app/data"
+  ACN_DATA_PATH: "/app/data/acn_sessions.csv"
+  ML_TIMEOUT_S: "5.0"
+  OPTIMIZER_TIMEOUT_S: "30.0"
