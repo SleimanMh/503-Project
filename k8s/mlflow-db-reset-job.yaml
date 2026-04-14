@@ -1,0 +1,20 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mlflow-db-reset
+  namespace: ev-charging
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: reset
+          image: busybox
+          command: ["sh", "-c", "rm -f /mlflow/mlflow.db && echo 'MLflow DB deleted'"]
+          volumeMounts:
+            - name: mlflow-data
+              mountPath: /mlflow
+      volumes:
+        - name: mlflow-data
+          persistentVolumeClaim:
+            claimName: mlflow-data-pvc

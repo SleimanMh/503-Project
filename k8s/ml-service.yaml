@@ -31,6 +31,33 @@ spec:
           envFrom:
             - configMapRef:
                 name: ev-charging-config
+          env:
+            # S3 bucket for model storage — set by aws-credentials secret.
+            # If secret does not exist, MODELS_S3_BUCKET stays empty (S3 disabled).
+            - name: MODELS_S3_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  name: aws-credentials
+                  key: bucket
+                  optional: true
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: aws-credentials
+                  key: aws_access_key_id
+                  optional: true
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aws-credentials
+                  key: aws_secret_access_key
+                  optional: true
+            - name: AWS_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: aws-credentials
+                  key: region
+                  optional: true
           volumeMounts:
             - name: shared-data
               mountPath: /app/data

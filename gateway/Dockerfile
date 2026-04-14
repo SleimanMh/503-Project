@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir -r dashboard-requirements.txt
 COPY app/ app/
 COPY dashboard/ dashboard/
 COPY start.sh .
-RUN chmod +x start.sh
+RUN sed -i 's/\r$//' start.sh && chmod +x start.sh
 
 EXPOSE 8000 8501
 

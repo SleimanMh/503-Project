@@ -168,7 +168,10 @@ async def run_simulation(request: SimulationRequest) -> SimulationResponse:
     # ══════════════════════════════════════════════════════════════════════
     #  ML FEATURE 1: Departure Time Prediction  (per-vehicle)
     # ══════════════════════════════════════════════════════════════════════
-    departure_predictions = {}
+    # departure_predictions[ev_id] = {"q50": float, "q90": float}  (minutes)
+    departure_predictions: dict[str, dict] = {}
+    # energy_predictions[ev_id] = predicted_kwh from M3 (used when energy_needed == 0)
+    energy_predictions: dict[str, float] = {}
     ml_pred_count = 0
     ml_skip_count = 0
     try:
@@ -177,54 +180,101 @@ async def run_simulation(request: SimulationRequest) -> SimulationResponse:
                 arrival = ev.arrival_time or now
                 energy_needed = ev.battery_capacity_kwh * (ev.target_pct - ev.battery_pct) / 100
                 energy_needed = max(0, energy_needed)
+
+                # M3: if energy is unknown (battery info missing), predict it
+                if energy_needed < 0.5:
+                    try:
+                        e_resp = await client.post(
+                            f"{ML_SERVICE_URL}/predict-energy",
+                            json={
+                                "arrival_time": arrival.isoformat(),
+                                "site_id": "0002",
+                                "cluster_id": "0039",
+                            },
+                        )
+                        if e_resp.status_code == 200:
+                            energy_predictions[ev.ev_id] = e_resp.json()["predicted_kwh"]
+                    except Exception:
+                        pass  # fallback handled downstream
+
+                # M1: departure prediction returning Q10/Q50/Q90
+                eff_energy = energy_predictions.get(ev.ev_id, energy_needed)
                 resp = await client.post(
                     f"{ML_SERVICE_URL}/predict-departure",
                     json={
                         "arrival_time": arrival.isoformat(),
                         "site_id": "0002",
                         "cluster_id": "0039",
-                        "requested_energy_kwh": round(energy_needed, 3),
+                        "requested_energy_kwh": round(eff_energy, 3),
                     },
                 )
                 if resp.status_code == 200:
                     data = resp.json()
-                    departure_predictions[ev.ev_id] = data["predicted_stay_duration_min"]
+                    departure_predictions[ev.ev_id] = {
+                        "q50": data.get("predicted_stay_q50_min",
+                                        data.get("predicted_stay_duration_min", 120.0)),
+                        "q90": data.get("predicted_stay_q90_min",
+                                        data.get("predicted_stay_duration_min", 120.0)),
+                    }
     except Exception as e:
         logger.warning(f"ML departure prediction unavailable: {e}")
 
     # ══════════════════════════════════════════════════════════════════════
-    #  ML FEATURE 2: Demand Forecasting  (aggregate future arrivals)
+    #  ML FEATURE 2: Arrivals Forecast M4A  (15-min slot predictions)
     # ══════════════════════════════════════════════════════════════════════
     ml_future_arrivals = []
     try:
-        horizon_windows = max(1, int(request.simulation_duration_hours * 2))
+        horizon_slots = max(1, int(request.simulation_duration_hours * 4))  # 15-min slots
         async with httpx.AsyncClient(timeout=ML_TIMEOUT_S) as client:
             resp = await client.post(
-                f"{ML_SERVICE_URL}/forecast",
+                f"{ML_SERVICE_URL}/predict-arrivals",
                 json={
                     "current_time": now.isoformat(),
-                    "horizon_windows": min(horizon_windows, 96),
+                    "horizon_slots": min(horizon_slots, 96),
                     "recent_arrivals": [],
-                    "recent_kwh": [],
                 },
             )
             if resp.status_code == 200:
-                forecast_data = resp.json()
-                for point in forecast_data["forecast"]:
-                    window_start = datetime.fromisoformat(point["window_start"])
-                    minutes_from_now = max(0, (window_start - now).total_seconds() / 60)
-                    slot_idx = int(minutes_from_now / request.time_step_minutes)
-
-                    if slot_idx < num_slots and point["predicted_arrivals"] > 0.3:
+                arr_data = resp.json()
+                for slot_pred in arr_data["predictions"]:
+                    slot_idx = slot_pred["slot_index"]
+                    q50 = slot_pred["arrivals_q50"]
+                    if slot_idx < num_slots and q50 > 0.3:
+                        # Convert per-slot count + ACN mean kWh (8.5 kWh/session) to FutureArrival format
                         ml_future_arrivals.append({
                             "slot": slot_idx,
-                            "predicted_count": point["predicted_arrivals"],
-                            "predicted_kwh": point["predicted_kwh"],
+                            "predicted_count": q50,
+                            "predicted_kwh": q50 * 8.5,
                             "avg_charge_kw": 7.2,
                         })
-                logger.info(f"ML forecast: {len(ml_future_arrivals)} future arrival windows")
+                logger.info(f"M4A arrivals forecast: {len(ml_future_arrivals)} slots with predicted arrivals")
+            else:
+                # Fallback: try legacy /forecast endpoint
+                horizon_windows = max(1, int(request.simulation_duration_hours * 2))
+                resp2 = await client.post(
+                    f"{ML_SERVICE_URL}/forecast",
+                    json={
+                        "current_time": now.isoformat(),
+                        "horizon_windows": min(horizon_windows, 96),
+                        "recent_arrivals": [],
+                        "recent_kwh": [],
+                    },
+                )
+                if resp2.status_code == 200:
+                    forecast_data = resp2.json()
+                    for point in forecast_data["forecast"]:
+                        window_start = datetime.fromisoformat(point["window_start"])
+                        minutes_from_now = max(0, (window_start - now).total_seconds() / 60)
+                        slot_idx = int(minutes_from_now / request.time_step_minutes)
+                        if slot_idx < num_slots and point["predicted_arrivals"] > 0.3:
+                            ml_future_arrivals.append({
+                                "slot": slot_idx,
+                                "predicted_count": point["predicted_arrivals"],
+                                "predicted_kwh": point["predicted_kwh"],
+                                "avg_charge_kw": 7.2,
+                            })
     except Exception as e:
-        logger.warning(f"ML demand forecast unavailable: {e}")
+        logger.warning(f"ML arrivals forecast unavailable: {e}")
 
     # ── Build vehicle lists with ACN-driven "actual" departures ────────
     #
@@ -260,6 +310,9 @@ async def run_simulation(request: SimulationRequest) -> SimulationResponse:
     for ev in request.vehicles:
         energy_needed = ev.battery_capacity_kwh * (ev.target_pct - ev.battery_pct) / 100
         energy_needed = max(0, energy_needed)
+        # Use M3 prediction when battery SoC info is missing/zero
+        if energy_needed < 0.5 and ev.ev_id in energy_predictions:
+            energy_needed = energy_predictions[ev.ev_id]
 
         arrival_slot = 0
         if ev.arrival_time:
@@ -276,24 +329,35 @@ async def run_simulation(request: SimulationRequest) -> SimulationResponse:
         arrival_hour = (ev.arrival_time or now).hour
         acn_mean, acn_std = _acn_stay(arrival_hour)
 
-        ml_predicted_stay = None
+        ml_predicted_q50 = None   # Q50 planning horizon (minutes)
+        ml_predicted_q90 = None   # Q90 conservative window for LP (minutes)
         if ev.planned_departure_time:
             # User gave explicit departure → known truth for all strategies
             actual_stay = max(15, (ev.planned_departure_time - (ev.arrival_time or now)).total_seconds() / 60)
-            ml_predicted_stay = actual_stay  # no prediction needed
+            ml_predicted_q50 = actual_stay
+            ml_predicted_q90 = actual_stay
             ml_skip_count += 1
         else:
             # GROUND TRUTH: sample from ACN per-hour distribution
-            # This is what really happens — independent of any prediction method.
             actual_stay = max(30, rng_actual.gauss(acn_mean, acn_std))
 
             if ev.ev_id in departure_predictions:
-                # ML prediction: actual stay + realistic ML-level error
-                # ML model has MAE ≈ 112 min → σ ≈ 89.6 min
-                ml_error = rng_ml.gauss(0, ML_ERROR_SIGMA)
-                ml_predicted_stay = max(15, actual_stay + ml_error)
+                # Use ML Q50 and Q90 directly from the quantile model —
+                # no hardcoded +σ buffer needed.  Q90 IS the 90th percentile
+                # of the departure distribution given the context features.
+                preds = departure_predictions[ev.ev_id]
+                ml_error = rng_ml.gauss(0, ML_ERROR_SIGMA)  # retain for simulation realism
+                ml_predicted_q50 = max(15, actual_stay + ml_error)
+                # Use model Q90 if plausible; otherwise shift Q50 by error margin
+                raw_q90 = preds["q90"]
+                raw_q50 = preds["q50"]
+                if raw_q90 > raw_q50:
+                    # Scale the model's Q90-Q50 spread onto the simulated Q50
+                    ml_predicted_q90 = ml_predicted_q50 + max(0, raw_q90 - raw_q50)
+                else:
+                    ml_predicted_q90 = ml_predicted_q50
                 ml_pred_count += 1
-                departure_predictions_used[ev.ev_id] = ml_predicted_stay
+                departure_predictions_used[ev.ev_id] = ml_predicted_q50
             else:
                 ml_skip_count += 1
 
@@ -302,23 +366,23 @@ async def run_simulation(request: SimulationRequest) -> SimulationResponse:
         actual_stay_map[ev.ev_id] = actual_stay
         energy_needed_map[ev.ev_id] = energy_needed
 
-        # ML vehicle: uses ML-predicted departure + uncertainty buffer.
-        # The buffer (1σ of ML error) extends the LP's presence window so
-        # that underestimation doesn't create a hard cutoff.  Front-loading
-        # still concentrates energy early, but the LP CAN use later slots
-        # if the vehicle stays longer than predicted.  This covers ~84%
-        # of underestimation cases.
-        if ml_predicted_stay is not None:
-            buffered_stay = ml_predicted_stay + ML_ERROR_SIGMA  # +1σ buffer
-            ml_dep = min(num_slots, arrival_slot + max(1, int(buffered_stay / request.time_step_minutes)))
+        # ML vehicle: LP presence window = Q90 departure slot.
+        # Front-loading decay (1.0→0.3 over the Q90 window) ensures most
+        # energy is delivered in the Q50 region, making the schedule robust
+        # to early departure while still having budget for the full Q90 window.
+        if ml_predicted_q50 is not None:
+            ml_dep_q50 = min(num_slots, arrival_slot + max(1, int(ml_predicted_q50 / request.time_step_minutes)))
+            ml_dep_q90 = min(num_slots, arrival_slot + max(1, int((ml_predicted_q90 or ml_predicted_q50) / request.time_step_minutes)))
         else:
-            ml_dep = actual_dep  # fallback: no prediction available
+            ml_dep_q50 = actual_dep
+            ml_dep_q90 = None
         ml_vehicles.append({
             "ev_id": ev.ev_id,
             "energy_needed_kwh": round(max(0.1, energy_needed), 3),
             "max_charge_kw": ev.max_charge_kw,
             "arrival_slot": arrival_slot,
-            "departure_slot": ml_dep,
+            "departure_slot": ml_dep_q50,
+            "departure_q90_slot": ml_dep_q90,
         })
 
         # No-ML vehicle: uses ACN per-hour mean as best guess (no ML)
@@ -430,7 +494,7 @@ async def run_simulation(request: SimulationRequest) -> SimulationResponse:
             )
 
     # ── ML Metrics ──
-    pred_stays = list(departure_predictions.values())
+    pred_stays = [v["q50"] for v in departure_predictions.values()] if departure_predictions else []
     total_reserved = sum(
         fa["predicted_kwh"] for fa in ml_future_arrivals
     ) if ml_future_arrivals else 0

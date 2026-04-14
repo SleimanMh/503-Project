@@ -24,7 +24,7 @@ RUN wget -q "https://dl.grafana.com/oss/release/grafana_${GRAFANA_VERSION}_amd64
     && rm -f "grafana_${GRAFANA_VERSION}_amd64.deb"
 
 # ── Install MLflow ──
-RUN pip install --no-cache-dir mlflow>=2.9.0
+RUN pip install --no-cache-dir "mlflow[skinny]>=2.9.0"
 
 # ── Create data directories ──
 RUN mkdir -p /mlflow/artifacts /prometheus /var/lib/grafana

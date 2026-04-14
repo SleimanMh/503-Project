@@ -58,9 +58,39 @@ services:
       - prometheus_data:/prometheus
       - grafana_data:/var/lib/grafana
       - mlflow_data:/mlflow
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
     networks:
       - internal
     restart: unless-stopped
+
+  # ── Retraining service (profile: retrain) ────────────────────────────────
+  # Does NOT start with `docker compose up` — only when explicitly triggered.
+  # Local:   docker compose --profile retrain run --rm retrain
+  # AWS ECS: schedule via EventBridge → RunTask
+  retrain:
+    build: ./ml-service
+    profiles: ["retrain"]
+    volumes:
+      - ./data:/app/data
+      - ./ml-service/artifacts:/app/artifacts
+    environment:
+      - DATA_DIR=/app/data
+      - ACN_DATA_PATH=/app/data/acn_sessions.csv
+      - MLFLOW_TRACKING_URI=http://monitoring:5000
+      - ML_SERVICE_URL=http://ml-service:8001
+    networks:
+      - internal
+    restart: "no"
+    command: >
+      sh -c "
+        python -m training.prepare_data --data-path /app/data/acn_sessions.csv --output-dir artifacts/ &&
+        python -m training.train_departure --artifacts-dir artifacts/ &&
+        python -m training.train_energy --artifacts-dir artifacts/ &&
+        python -m training.train_arrivals --artifacts-dir artifacts/ &&
+        curl -sf -X POST http://ml-service:8001/retrain || echo 'hot-reload skipped (ml-service not reachable)'
+      "
+    depends_on:
+      - ml-service
 
 volumes:
   prometheus_data:
@@ -71,3 +101,14 @@ networks:
   internal:
     driver: bridge
     # Container 2 and 3 are only accessible via this private network
+
+# ── Retraining service (profile: retrain) ────────────────────────────────────
+# Run on-demand or via a cron/scheduler. Does NOT start with `docker compose up`.
+#
+# Local:   docker compose --profile retrain run --rm retrain
+# AWS ECS: use as a scheduled task (EventBridge → ECS RunTask)
+# ---------------------------------------------------------------------------
+# Note: defined here so it shares the same internal network and data volume
+# as ml-service. After training completes, call POST /retrain on ml-service
+# to hot-reload without a restart.
+

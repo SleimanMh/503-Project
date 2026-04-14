@@ -8,7 +8,13 @@ class EVVehicle(BaseModel):
     energy_needed_kwh: float = Field(gt=0, description="Remaining energy to deliver (kWh)")
     max_charge_kw: float = Field(gt=0, le=350, description="Max charger power (kW)")
     arrival_slot: int = Field(ge=0, description="Time slot when vehicle arrived")
-    departure_slot: int = Field(gt=0, description="Time slot when vehicle departs")
+    departure_slot: int = Field(gt=0, description="Predicted median (Q50) departure slot — used as planning horizon")
+    departure_q90_slot: int | None = Field(
+        default=None,
+        description="Conservative (Q90) departure slot from ML model. "
+                    "When provided, the LP uses this as the presence window instead of departure_slot, "
+                    "concentrating energy delivery toward the Q50 region via front-loading decay.",
+    )
 
 
 class FutureArrival(BaseModel):

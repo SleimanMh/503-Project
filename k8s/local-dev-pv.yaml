@@ -1,0 +1,87 @@
+# ── Local Dev HostPath PersistentVolumes (Docker Desktop Kubernetes only) ────
+# Binds K8s PVCs to local host directories so .joblib artifacts, ACN data,
+# and Grafana provisioning are immediately available without a data-loading job.
+#
+# Docker Desktop exposes the Windows C: drive inside the K8s node at:
+#   /run/desktop/mnt/host/c/...
+#
+# To use: kubectl apply -f k8s/local-dev-pv.yaml  (before volumes.yaml)
+# For AWS EKS: skip this file — EBS/EFS PVs are provisioned automatically.
+# ---------------------------------------------------------------------------
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: shared-data-pv
+  labels:
+    type: local
+    app.kubernetes.io/part-of: ev-charging-optimizer
+spec:
+  storageClassName: manual
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadWriteOnce
+  hostPath:
+    path: /run/desktop/mnt/host/c/Users/sleim/Downloads/Proj-test/data
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: ml-artifacts-pv
+  labels:
+    type: local
+    app.kubernetes.io/part-of: ev-charging-optimizer
+spec:
+  storageClassName: manual
+  capacity:
+    storage: 500Mi
+  accessModes:
+    - ReadWriteOnce
+  hostPath:
+    path: /run/desktop/mnt/host/c/Users/sleim/Downloads/Proj-test/ml-service/artifacts
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: prometheus-data-pv
+  labels:
+    type: local
+spec:
+  storageClassName: manual
+  capacity:
+    storage: 2Gi
+  accessModes:
+    - ReadWriteOnce
+  hostPath:
+    path: /run/desktop/mnt/host/c/Users/sleim/Downloads/Proj-test/.k8s-data/prometheus
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: grafana-data-pv
+  labels:
+    type: local
+spec:
+  storageClassName: manual
+  capacity:
+    storage: 500Mi
+  accessModes:
+    - ReadWriteOnce
+  hostPath:
+    path: /run/desktop/mnt/host/c/Users/sleim/Downloads/Proj-test/.k8s-data/grafana
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: mlflow-data-pv
+  labels:
+    type: local
+spec:
+  storageClassName: manual
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadWriteOnce
+  hostPath:
+    path: /run/desktop/mnt/host/c/Users/sleim/Downloads/Proj-test/.k8s-data/mlflow

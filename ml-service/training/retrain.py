@@ -44,6 +44,7 @@ from training.prepare_data import (
     DEPARTURE_FEATURE_COLS,
     DEPARTURE_TARGET_COL,
 )
+from training.s3_store import upload_models_to_s3, upload_sessions_to_s3, upload_user_profiles_to_s3
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 logger = logging.getLogger(__name__)
@@ -288,6 +289,10 @@ def run_retrain(
 
     # ── Archive processed collected sessions ──────────────────────────────
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+    # Upload raw sessions to S3 BEFORE archiving locally
+    upload_sessions_to_s3(collected_path)
+
     archive_path = collected_path.parent / f"collected_sessions_processed_{ts}.csv"
     shutil.move(str(collected_path), str(archive_path))
     logger.info(f"Archived processed sessions to {archive_path}")
@@ -316,6 +321,12 @@ def run_retrain(
         logger.info("MLflow: retraining run logged.")
 
     logger.info("Retraining complete.")
+
+    # ── Push new models to S3 so all pods pick them up on next restart ────
+    upload_models_to_s3(artifacts_dir)
+    # Also back up the user profiles DB
+    from app.config import USER_PROFILES_DB
+    upload_user_profiles_to_s3(USER_PROFILES_DB)
 
     return {
         "retrained": True,

@@ -1,0 +1,8 @@
+{
+  "test_mae_kwh": 3.8695,
+  "test_rmse_kwh": 5.6794,
+  "q10_q90_coverage_pct": 56.47,
+  "n_features": 18,
+  "train_rows": 16410,
+  "test_rows": 4689
+}

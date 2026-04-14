@@ -25,6 +25,7 @@ spec:
         - name: gateway
           image: proj-test-gateway:latest
           imagePullPolicy: IfNotPresent
+          command: ["bash", "-c", "sed -i 's/\\r$//' /app/start.sh && bash /app/start.sh"]
           ports:
             - containerPort: 8000
               name: api

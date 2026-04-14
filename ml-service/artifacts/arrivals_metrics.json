@@ -1,0 +1,9 @@
+{
+  "test_mae": 0.5138,
+  "test_rmse": 0.7021,
+  "q10_q90_coverage_pct": 97.85,
+  "mean_arrivals_per_slot": 0.2548,
+  "n_features": 15,
+  "train_rows": 35765,
+  "test_rows": 10219
+}

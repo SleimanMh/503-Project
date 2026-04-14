@@ -1,0 +1,115 @@
+# Daily retraining pipeline — runs at 02:00 UTC every night.
+#
+# Steps (in order):
+#   1. aws-sync initContainer:  upload collected_sessions.csv → S3
+#   2. retrain initContainer:   call POST /retrain on ml-service
+#                               retrain.py merges data, trains models,
+#                               uploads new models to S3 automatically.
+#
+# Requirements:
+#   - Secret "aws-credentials" must exist in the ev-charging namespace
+#     (see k8s/aws-credentials-secret.yaml.example for the template)
+#   - MODELS_S3_BUCKET env var must be set in the ml-service deployment
+#     OR in this CronJob's env block below.
+#
+# Local dev (no AWS):
+#   Set MODELS_S3_BUCKET="" (empty) — the sync step becomes a no-op and
+#   the retrain still runs locally, saving models to the PVC.
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: daily-retrain
+  namespace: ev-charging
+  labels:
+    app: daily-retrain
+    app.kubernetes.io/part-of: ev-charging-optimizer
+spec:
+  # Run at 02:00 UTC every day
+  schedule: "0 2 * * *"
+  concurrencyPolicy: Forbid        # prevent overlap if retrain takes > 24h
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # Allow up to 2 hours for retraining to complete
+      activeDeadlineSeconds: 7200
+      template:
+        spec:
+          restartPolicy: OnFailure
+          volumes:
+            - name: shared-data
+              persistentVolumeClaim:
+                claimName: shared-data-pvc
+
+          initContainers:
+            # ── Step 1: Upload sessions to S3 ─────────────────────────────
+            - name: s3-sync
+              image: amazon/aws-cli:latest
+              command:
+                - sh
+                - -c
+                - |
+                  if [ -z "$MODELS_S3_BUCKET" ]; then
+                    echo "MODELS_S3_BUCKET not set — skipping S3 sync"
+                    exit 0
+                  fi
+                  SESSIONS=/data/collected_sessions.csv
+                  if [ ! -f "$SESSIONS" ]; then
+                    echo "No collected_sessions.csv found — nothing to sync"
+                    exit 0
+                  fi
+                  DATE=$(date -u +%Y/%m/%d)
+                  KEY="data/sessions/$DATE/sessions.csv"
+                  echo "Uploading $SESSIONS → s3://$MODELS_S3_BUCKET/$KEY"
+                  aws s3 cp "$SESSIONS" "s3://$MODELS_S3_BUCKET/$KEY"
+                  echo "Upload complete."
+              env:
+                - name: MODELS_S3_BUCKET
+                  valueFrom:
+                    secretKeyRef:
+                      name: aws-credentials
+                      key: bucket
+                      optional: true
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: aws-credentials
+                      key: aws_access_key_id
+                      optional: true
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: aws-credentials
+                      key: aws_secret_access_key
+                      optional: true
+                - name: AWS_REGION
+                  valueFrom:
+                    secretKeyRef:
+                      name: aws-credentials
+                      key: region
+                      optional: true
+              volumeMounts:
+                - name: shared-data
+                  mountPath: /data
+
+          containers:
+            # ── Step 2: Trigger retraining on the ml-service ──────────────
+            - name: retrain-trigger
+              image: curlimages/curl:latest
+              command:
+                - sh
+                - -c
+                - |
+                  echo "Triggering retraining on ml-service..."
+                  # Use force=false so retrain only runs if >= 500 new sessions exist.
+                  # Change to force=true to always retrain (e.g. weekly scheduled full retrain).
+                  RESPONSE=$(curl -s -o /tmp/retrain_response.json -w "%{http_code}" \
+                    -X POST "http://ml-service.ev-charging.svc.cluster.local:8001/retrain?force=false")
+                  echo "HTTP status: $RESPONSE"
+                  cat /tmp/retrain_response.json
+                  if [ "$RESPONSE" != "200" ]; then
+                    echo "Retrain request failed with status $RESPONSE"
+                    exit 1
+                  fi
+                  echo "Retraining complete."

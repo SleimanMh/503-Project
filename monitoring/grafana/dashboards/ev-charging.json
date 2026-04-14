@@ -9,6 +9,190 @@
     {
       "title": "Service Health",
       "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "targets": [
+        { "expr": "up", "legendFormat": "{{job}}", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } }, "type": "value" }
+          ],
+          "thresholds": { "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }
+        }
+      }
+    },
+    {
+      "title": "ML Models Loaded",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "targets": [
+        { "expr": "ml_model_loaded", "legendFormat": "{{model_name}}", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "options": { "0": { "text": "NOT LOADED", "color": "red" }, "1": { "text": "LOADED", "color": "green" } }, "type": "value" }
+          ]
+        }
+      }
+    },
+    {
+      "title": "Request Rate (all services)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        { "expr": "sum(rate(http_requests_total[5m])) by (handler)", "legendFormat": "{{handler}}", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps" } }
+    },
+    {
+      "title": "Request Latency p50 / p95 / p99",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, handler))",
+          "legendFormat": "p50 {{handler}}", "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, handler))",
+          "legendFormat": "p95 {{handler}}", "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, handler))",
+          "legendFormat": "p99 {{handler}}", "refId": "C"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+
+    { "type": "row", "title": "ML — Prediction Volumes", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 12 }, "collapsed": false },
+
+    {
+      "title": "Departure Predictions (total)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 13 },
+      "targets": [
+        { "expr": "ml_departure_predictions_total", "legendFormat": "total", "refId": "A" }
+      ]
+    },
+    {
+      "title": "Energy Predictions (total)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 13 },
+      "targets": [
+        { "expr": "ml_energy_predictions_total", "legendFormat": "total", "refId": "A" }
+      ]
+    },
+    {
+      "title": "Arrivals Forecasts (total)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 13 },
+      "targets": [
+        { "expr": "ml_arrivals_forecasts_total", "legendFormat": "total", "refId": "A" }
+      ]
+    },
+    {
+      "title": "Retraining Events",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 13 },
+      "targets": [
+        { "expr": "ml_retrain_total", "legendFormat": "{{status}}", "refId": "A" }
+      ]
+    },
+
+    { "type": "row", "title": "ML — Inference Latency", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 17 }, "collapsed": false },
+
+    {
+      "title": "Departure Prediction Latency",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 18 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, rate(ml_departure_prediction_seconds_bucket[5m]))", "legendFormat": "p50", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, rate(ml_departure_prediction_seconds_bucket[5m]))", "legendFormat": "p95", "refId": "B" },
+        { "expr": "histogram_quantile(0.99, rate(ml_departure_prediction_seconds_bucket[5m]))", "legendFormat": "p99", "refId": "C" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "title": "Energy Prediction Latency",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 18 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, rate(ml_energy_prediction_seconds_bucket[5m]))", "legendFormat": "p50", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, rate(ml_energy_prediction_seconds_bucket[5m]))", "legendFormat": "p95", "refId": "B" },
+        { "expr": "histogram_quantile(0.99, rate(ml_energy_prediction_seconds_bucket[5m]))", "legendFormat": "p99", "refId": "C" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "title": "Arrivals Forecast Latency",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 18 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, rate(ml_arrivals_forecast_seconds_bucket[5m]))", "legendFormat": "p50", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, rate(ml_arrivals_forecast_seconds_bucket[5m]))", "legendFormat": "p95", "refId": "B" },
+        { "expr": "histogram_quantile(0.99, rate(ml_arrivals_forecast_seconds_bucket[5m]))", "legendFormat": "p99", "refId": "C" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+
+    { "type": "row", "title": "Optimizer — LP Scheduling", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 26 }, "collapsed": false },
+
+    {
+      "title": "LP Solve Latency p95 by Strategy",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 27 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(optimizer_solve_seconds_bucket[5m])) by (le, strategy))",
+          "legendFormat": "p95 {{strategy}}", "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "title": "Optimizer Requests by Strategy",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 27 },
+      "targets": [
+        { "expr": "rate(optimizer_requests_total[5m])", "legendFormat": "{{strategy}}", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps" } }
+    },
+
+    { "type": "row", "title": "HTTP Errors", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 35 }, "collapsed": false },
+
+    {
+      "title": "HTTP Error Rate (5xx)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 36 },
+      "targets": [
+        { "expr": "sum(rate(http_requests_total{status=~\"5..\"}[5m])) by (handler)", "legendFormat": "5xx {{handler}}", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps" } }
+    },
+    {
+      "title": "HTTP Response Codes (1h)",
+      "type": "piechart",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 36 },
+      "targets": [
+        { "expr": "sum(increase(http_requests_total[1h])) by (status)", "legendFormat": "{{status}}", "refId": "A" }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["ev-charging", "ml", "monitoring"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "title": "EV Charging Optimization System",
+  "uid": "ev-charging-main",
+  "version": 2
+}
+    {
+      "title": "Service Health",
+      "type": "stat",
       "gridPos": { "h": 4, "w": 8, "x": 0, "y": 0 },
       "targets": [
         {
