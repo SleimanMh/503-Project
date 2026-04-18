@@ -13,6 +13,7 @@ from prometheus_fastapi_instrumentator import Instrumentator
 from app.config import ML_SERVICE_URL, OPTIMIZER_SERVICE_URL
 from app.routers.simulation import router as simulation_router
 from app.routers.ml_monitoring import router as ml_monitoring_router
+from app.routers.ocpp import router as ocpp_router
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -36,6 +37,7 @@ app = FastAPI(
 
 app.include_router(simulation_router)
 app.include_router(ml_monitoring_router)
+app.include_router(ocpp_router)
 
 # Prometheus metrics — exposes /metrics endpoint
 Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=True)

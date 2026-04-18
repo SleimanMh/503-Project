@@ -84,6 +84,24 @@ def _load_collected_sessions(path: Path) -> pd.DataFrame:
     return df.sort_values("connection_time").reset_index(drop=True)
 
 
+def _load_ocpp_sessions(path: Path) -> pd.DataFrame:
+    """Load OCPP-collected sessions (ocpp_sessions.csv) and normalise to ACN schema."""
+    df = pd.read_csv(path, parse_dates=["connection_time", "disconnect_time"])
+    df = df.dropna(subset=["connection_time", "kwh_delivered"])
+    df = df[df["kwh_delivered"] > 0].copy()
+    df = df[df["duration_hr"] > 0].copy()
+    df["duration_min"] = df["duration_hr"] * 60
+    df["connection_time"] = pd.to_datetime(df["connection_time"], utc=True)
+    df["disconnect_time"] = pd.to_datetime(df["disconnect_time"], utc=True)
+    df["arrival_hour"] = df["connection_time"].dt.hour + df["connection_time"].dt.minute / 60
+    df["departure_hour"] = df["disconnect_time"].dt.hour + df["disconnect_time"].dt.minute / 60
+    df["day_of_week"] = df["connection_time"].dt.dayofweek
+    df["is_weekend"] = (df["day_of_week"] >= 5).astype(int)
+    df["month"] = df["connection_time"].dt.month
+    df["year"] = df["connection_time"].dt.year
+    return df.sort_values("connection_time").reset_index(drop=True)
+
+
 def _merge_datasets(acn_path: Path, collected_path: Path) -> pd.DataFrame:
     """Merge original ACN data with newly collected simulation sessions."""
     logger.info(f"Loading ACN baseline data: {acn_path}")
@@ -98,13 +116,32 @@ def _merge_datasets(acn_path: Path, collected_path: Path) -> pd.DataFrame:
     acn["connection_time"] = pd.to_datetime(acn["connection_time"], utc=True)
     acn["disconnect_time"] = pd.to_datetime(acn["disconnect_time"], utc=True)
 
-    logger.info(f"Loading collected sessions: {collected_path}")
-    collected = _load_collected_sessions(collected_path)
-    logger.info(f"  ACN sessions: {len(acn)}, collected sessions: {len(collected)}")
+    frames = [acn]
+    total_collected = 0
 
-    # Keep only columns that exist in both
-    common_cols = list(set(acn.columns) & set(collected.columns))
-    merged = pd.concat([acn[common_cols], collected[common_cols]], ignore_index=True)
+    logger.info(f"Loading collected sessions: {collected_path}")
+    if collected_path.exists():
+        collected = _load_collected_sessions(collected_path)
+        total_collected += len(collected)
+        frames.append(collected)
+    else:
+        logger.info("  collected_sessions.csv not found, skipping")
+
+    # Also load OCPP-native sessions if present
+    ocpp_path = collected_path.parent / "ocpp_sessions.csv"
+    if ocpp_path.exists():
+        ocpp = _load_ocpp_sessions(ocpp_path)
+        logger.info(f"  OCPP sessions: {len(ocpp)}")
+        total_collected += len(ocpp)
+        frames.append(ocpp)
+    else:
+        logger.info("  ocpp_sessions.csv not found, skipping")
+
+    logger.info(f"  ACN sessions: {len(acn)}, collected sessions: {total_collected}")
+
+    # Keep only columns that exist in all frames
+    common_cols = list(set.intersection(*[set(f.columns) for f in frames]))
+    merged = pd.concat([f[common_cols] for f in frames], ignore_index=True)
     merged = merged.sort_values("connection_time").reset_index(drop=True)
     logger.info(f"  Merged total: {len(merged)} sessions")
     return merged
@@ -191,9 +228,13 @@ def run_retrain(
     new_sessions = 0
     if has_collected:
         new_sessions = sum(1 for _ in open(collected_path)) - 1  # subtract header
+    ocpp_path = collected_path.parent / "ocpp_sessions.csv"
+    if ocpp_path.exists():
+        new_sessions += sum(1 for _ in open(ocpp_path)) - 1
+    if new_sessions > 0:
         logger.info(f"Collected sessions: {new_sessions} (threshold: {RETRAIN_THRESHOLD})")
     else:
-        logger.info("No collected_sessions.csv found.")
+        logger.info("No collected sessions found.")
 
     if not force and new_sessions < RETRAIN_THRESHOLD:
         return {

@@ -98,31 +98,21 @@ def optimize_schedule(
     n_vars = n_vehicles * num_slots  # x_{i,k} for each vehicle × slot
 
     # Build presence matrix: vehicle i is present in slot k?
-    # Use departure_q90_slot as the presence window when provided — this
-    # is the 90th-percentile departure from the ML quantile model, giving
-    # the LP room to schedule all needed energy even if the car stays
-    # longer than the median prediction.  Front-loading decay ensures
-    # most energy is delivered in the Q50 (median) region anyway.
     presence = np.zeros((n_vehicles, num_slots), dtype=bool)
     for i, v in enumerate(vehicles):
         start = max(0, v.arrival_slot)
-        # Q90 window takes priority; fall back to Q50 departure_slot
-        end_slot = v.departure_q90_slot if v.departure_q90_slot is not None else v.departure_slot
-        end = min(num_slots, end_slot)
+        end = min(num_slots, v.departure_slot)
         presence[i, start:end] = True
 
     # ── Front-loading decay per vehicle ──────────────────────────────────
     # For each vehicle, slots closer to arrival get higher weight.
-    # decay(k) = 1.0 - 0.7 * (k - arrival) / (window - 1)
-    # First slot = 1.0, last slot (Q90) = 0.3.
-    # Since most energy should arrive by Q50 departure, the schedule is
-    # naturally robust against early departure.
+    # decay(k) = 1.0 - 0.7 * (k - arrival) / (departure - arrival - 1)
+    # This means: first slot = 1.0, last slot = 0.3
     DECAY_MIN = 0.3
     decay = np.ones((n_vehicles, num_slots))
     for i, v in enumerate(vehicles):
         start = max(0, v.arrival_slot)
-        end_slot = v.departure_q90_slot if v.departure_q90_slot is not None else v.departure_slot
-        end = min(num_slots, end_slot)
+        end = min(num_slots, v.departure_slot)
         window = end - start
         if window > 1:
             for k in range(start, end):

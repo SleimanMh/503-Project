@@ -7,17 +7,31 @@ import json
 import random
 from datetime import datetime, timedelta, timezone
 
+import time
+
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+import streamlit.components.v1 as _components
 
 GATEWAY_URL = "http://localhost:8000"
 
-st.set_page_config(page_title="EV Charging Optimizer", layout="wide")
-st.title("EV Charging Optimization Dashboard")
+st.set_page_config(page_title="EV Charging System", layout="wide")
 
-# ── Sidebar: System Health ───────────────────────────────────────────────
+# ── Sidebar ───────────────────────────────────────────────────────────────
 with st.sidebar:
+    _view = st.radio(
+        "nav",
+        [
+            "📊 Optimizer Simulation",
+            "🔌 OCPP Live Monitor",
+            "📈 MLflow Tracking",
+            "📡 Grafana Monitoring",
+            "🔬 Prometheus Metrics",
+        ],
+        label_visibility="collapsed",
+    )
+    st.divider()
     st.header("System Status")
     try:
         health = requests.get(f"{GATEWAY_URL}/health", timeout=3).json()
@@ -326,6 +340,245 @@ def _topology_figure(params: dict, live_gv: dict | None = None) -> go.Figure:
     )
     return fig
 
+
+# ── OCPP Live Monitor (renders and stops when that view is selected) ──────
+if _view == "🔌 OCPP Live Monitor":
+    st.title("🔌 OCPP Live Monitor")
+    st.caption("Real-time OCPP 1.6J charge-point sessions — auto-refreshes while sessions are active")
+
+    _oc1, _oc2, _oc3 = st.columns([1, 2, 1])
+    with _oc1:
+        _auto_refresh = st.toggle("Auto-refresh", value=True)
+    with _oc2:
+        _refresh_s = st.slider("Refresh interval (s)", 2, 30, 5, label_visibility="collapsed")
+    with _oc3:
+        if st.button("🔄 Refresh", use_container_width=True):
+            st.rerun()
+
+    _sessions: list[dict] = []
+    _gw_up = False
+    try:
+        _r = requests.get(f"{GATEWAY_URL}/ocpp/sessions", timeout=5)
+        _r.raise_for_status()
+        _sessions = _r.json().get("sessions", [])
+        _gw_up = True
+    except requests.ConnectionError:
+        st.error(f"Cannot connect to gateway at `{GATEWAY_URL}`. Make sure the containers are running.")
+    except Exception as _ex:
+        st.error(f"Error fetching sessions: {_ex}")
+
+    _k1, _k2, _k3, _k4 = st.columns(4)
+    _k1.metric("Gateway", "🟢 UP" if _gw_up else "🔴 DOWN")
+    _k2.metric("Active Sessions", len(_sessions))
+    if _sessions:
+        _total_kw = sum(s.get("current_power_kw", 0.0) for s in _sessions)
+        _total_en  = sum(s.get("energy_needed_kwh", 0.0) for s in _sessions)
+        _total_del = sum((s.get("last_meter_wh", 0) - s.get("meter_start_wh", 0)) / 1000.0 for s in _sessions)
+        _k3.metric("Total Grid Load", f"{_total_kw:.1f} kW")
+        _k4.metric("Fleet Energy Progress", f"{_total_del:.2f} / {_total_en:.1f} kWh")
+    else:
+        _k3.metric("Total Grid Load", "0 kW")
+        _k4.metric("Fleet Energy Progress", "—")
+
+    st.divider()
+
+    # ── Simulation launcher ───────────────────────────────────────────────────
+    try:
+        _sim_st = requests.get(f"{GATEWAY_URL}/ocpp/simulate/status", timeout=3).json()
+    except Exception:
+        _sim_st = {"running": False, "vehicles": [], "error": None}
+
+    _sim_running = _sim_st.get("running", False)
+
+    with st.expander("🚀 Launch Simulation" if not _sim_running else "🔴 Simulation Running", expanded=not _sim_running and not _sessions):
+        if _sim_running:
+            _started = _sim_st.get("started_at", "")
+            st.success(f"Fleet simulation is running (started {_started[:19].replace('T',' ')} UTC)")
+            _vehs = _sim_st.get("vehicles", [])
+            if _vehs:
+                _vcols = st.columns(min(len(_vehs), 4))
+                for _vi, _vv in enumerate(_vehs):
+                    with _vcols[_vi % 4]:
+                        _done_icon = "✅" if _vv.get("done") else "⚡"
+                        st.caption(
+                            f"{_done_icon} **{_vv['cp_id']}**  \n"
+                            f"{_vv['battery_kwh']:.0f} kWh · {_vv['initial_soc']:.0f}% SOC  \n"
+                            f"{_vv['max_kw']:.1f} kW · stay {_vv['stay_min']:.0f} min"
+                        )
+            if st.button("⏹ Stop Simulation", type="secondary", use_container_width=True):
+                try:
+                    requests.post(f"{GATEWAY_URL}/ocpp/simulate/stop", timeout=5)
+                    st.rerun()
+                except Exception as _e:
+                    st.error(f"Stop failed: {_e}")
+        else:
+            _lc1, _lc2, _lc3 = st.columns(3)
+            with _lc1:
+                _l_fleet   = st.slider("Fleet size", 1, 10, 3, key="l_fleet")
+                _l_real    = st.checkbox("Realistic profiles", value=True, key="l_real")
+            with _lc2:
+                _l_speed   = st.select_slider(
+                    "Speed factor",
+                    options=[1, 5, 10, 30, 60, 120, 300],
+                    value=60,
+                    key="l_speed",
+                    help="1 = real time · 60 = 1 min of simulation per real second",
+                )
+                _l_interval = st.select_slider(
+                    "Meter interval (s)",
+                    options=[10, 15, 30, 60],
+                    value=30,
+                    key="l_interval",
+                )
+            with _lc3:
+                _l_seed    = st.number_input("Seed (blank = random)", value=None, step=1,
+                                             key="l_seed", format="%d",
+                                             placeholder="random")
+                _l_minutes = st.number_input("Session minutes (non-realistic)", value=30,
+                                             min_value=1, max_value=480, key="l_minutes",
+                                             disabled=bool(_l_real))
+
+            if st.button("▶ Start Fleet Simulation", type="primary", use_container_width=True):
+                _payload = {
+                    "fleet": _l_fleet,
+                    "realistic": _l_real,
+                    "speed_factor": float(_l_speed),
+                    "meter_interval": _l_interval,
+                    "seed": int(_l_seed) if _l_seed else None,
+                    "session_minutes": float(_l_minutes),
+                }
+                try:
+                    _sr = requests.post(f"{GATEWAY_URL}/ocpp/simulate/start",
+                                        json=_payload, timeout=8).json()
+                    if _sr.get("started"):
+                        st.success(f"Started {_sr['fleet']} vehicles at {_sr['speed_factor']}x speed!")
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        st.warning(_sr.get("reason", "Could not start"))
+                except Exception as _e:
+                    st.error(f"Failed to start simulation: {_e}")
+
+    st.divider()
+
+    if not _sessions:
+        st.info("No active sessions yet. Launch a simulation above or wait for a chargepoint to connect.")
+    else:
+        for _s in _sessions:
+            _cp_id   = _s["cp_id"]
+            _conn_id = _s["connector_id"]
+            _tx_id   = _s["transaction_id"]
+            _id_tag  = _s["id_tag"]
+            _stay    = _s.get("predicted_stay_min", 0.0)
+            _en_need = _s.get("energy_needed_kwh", 0.0)
+            _m_start = _s.get("meter_start_wh", 0.0)
+            _m_last  = _s.get("last_meter_wh", 0.0)
+            _sched   = _s.get("schedule_kw", [])
+            _cur_kw  = _s.get("current_power_kw", 0.0)
+            try:
+                _arr_dt  = datetime.fromisoformat(_s["arrival_time"])
+                _elapsed = (datetime.now(timezone.utc) - _arr_dt).total_seconds() / 60
+            except Exception:
+                _elapsed = 0.0
+            _del_kwh  = (_m_last - _m_start) / 1000.0
+            _prog_pct = min(_del_kwh / _en_need * 100, 100.0) if _en_need > 0 else 0.0
+            _rem_min  = max(_stay - _elapsed, 0.0)
+
+            with st.container(border=True):
+                _h1, _h2, _h3 = st.columns([3, 1, 1])
+                _h1.markdown(f"### ⚡ {_cp_id}  ·  Connector {_conn_id}")
+                _h2.markdown(f"**TX #{_tx_id}**")
+                _h3.markdown(f"ID Tag: `{_id_tag}`")
+
+                _m1, _m2, _m3, _m4, _m5 = st.columns(5)
+                _m1.metric("Elapsed",       f"{_elapsed:.0f} min")
+                _m2.metric("Remaining",     f"{_rem_min:.0f} min")
+                _m3.metric("Current Power", f"{_cur_kw:.2f} kW")
+                _m4.metric("Delivered",     f"{_del_kwh:.3f} kWh")
+                _m5.metric("Progress",      f"{_prog_pct:.0f}%")
+                st.progress(min(_del_kwh / _en_need, 1.0) if _en_need > 0 else 0.0)
+
+                if _sched:
+                    _ts_min      = 15
+                    _n           = len(_sched)
+                    _cur_slot    = min(int(_elapsed / _ts_min), _n - 1)
+                    _slot_labels = [f"+{i * _ts_min}m" for i in range(_n)]
+                    _max_p       = max(_sched) if max(_sched) > 0 else 1.0
+                    _bar_colors  = []
+                    for _i, _p in enumerate(_sched):
+                        if _i == _cur_slot:
+                            _bar_colors.append("rgba(231,76,60,0.85)")
+                        elif _p > 0:
+                            _alpha = 0.35 + 0.55 * _p / _max_p
+                            _bar_colors.append(f"rgba(39,174,96,{_alpha:.2f})")
+                        else:
+                            _bar_colors.append("rgba(189,195,199,0.4)")
+
+                    _fig_s = go.Figure()
+                    _fig_s.add_trace(go.Bar(
+                        x=_slot_labels, y=_sched,
+                        marker_color=_bar_colors,
+                        text=[f"{_p:.1f}" for _p in _sched],
+                        textposition="outside", name="kW",
+                    ))
+                    if 0 <= _cur_slot < _n:
+                        _fig_s.add_vline(
+                            x=_cur_slot,
+                            line=dict(color="rgba(231,76,60,0.6)", width=2, dash="dot"),
+                            annotation_text="▶ now",
+                            annotation_position="top right",
+                            annotation_font=dict(color="rgba(231,76,60,0.9)", size=11),
+                        )
+                    _fig_s.update_layout(
+                        title=dict(text=f"LP Schedule — {_cp_id} connector {_conn_id}", font=dict(size=13)),
+                        xaxis_title="Slot (from arrival)", yaxis_title="Power (kW)",
+                        height=220, margin=dict(l=40, r=20, t=40, b=30),
+                        showlegend=False,
+                        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                    )
+                    st.plotly_chart(_fig_s, use_container_width=True)
+                    _nonzero = [(f"+{_i*_ts_min}m", _p) for _i, _p in enumerate(_sched) if _p > 0]
+                    _summary = "  ·  ".join(f"`{_t}` → **{_p:.1f} kW**" for _t, _p in _nonzero)
+                    st.caption(f"Schedule: {_summary}")
+                else:
+                    st.caption("Schedule not yet available.")
+
+                st.caption(
+                    f"Arrival: {_s['arrival_time']} | "
+                    f"Predicted stay: {_stay:.0f} min | "
+                    f"Key: `{_s['session_key']}`"
+                )
+
+    if _auto_refresh and _gw_up:
+        time.sleep(_refresh_s)
+        st.rerun()
+
+    st.stop()  # do not render simulation UI when OCPP view is active
+
+# ── MLflow Tracking ───────────────────────────────────────────────────────
+if _view == "📈 MLflow Tracking":
+    st.header("📈 MLflow Experiment Tracking")
+    st.caption("Displays MLflow at http://localhost:5000 — compare runs, view metrics, and inspect model artifacts.")
+    _components.iframe("http://localhost:5000", height=900, scrolling=True)
+    st.stop()
+
+# ── Grafana Monitoring ────────────────────────────────────────────────────
+if _view == "📡 Grafana Monitoring":
+    st.header("📡 Grafana Monitoring")
+    st.caption("Displays Grafana at http://localhost:3000 — system metrics, charging KPIs, and grid health. Default login: admin / admin.")
+    _components.iframe("http://localhost:3000", height=900, scrolling=True)
+    st.stop()
+
+# ── Prometheus Metrics ────────────────────────────────────────────────────
+if _view == "🔬 Prometheus Metrics":
+    st.header("🔬 Prometheus Metrics")
+    st.caption("Displays Prometheus at http://localhost:9090 — raw metric queries and target scrape status.")
+    _components.iframe("http://localhost:9090", height=900, scrolling=True)
+    st.stop()
+
+
+# ── Optimizer Simulation ─────────────────────────────────────────────────
+st.title("EV Charging Optimization Dashboard")
 
 # ── Grid Network ─────────────────────────────────────────────────────────
 st.header("⚡ Grid Network")
