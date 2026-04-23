@@ -8,6 +8,7 @@ Usage:
 
 import argparse
 import json
+import os
 import pickle
 from pathlib import Path
 
@@ -141,34 +142,41 @@ def train_demand_model(artifacts_dir: str = "artifacts/"):
     print(f"Metrics saved to {artifacts}/demand_metrics.json")
 
     # ── MLflow experiment tracking ──
-    mlflow.set_experiment("demand-forecasting")
-    with mlflow.start_run(run_name="demand-xgboost"):
-        # Log hyperparameters
-        mlflow.log_params({
-            "n_estimators": 300,
-            "max_depth": 5,
-            "learning_rate": 0.05,
-            "subsample": 0.8,
-            "colsample_bytree": 0.8,
-            "min_child_weight": 5,
-            "reg_alpha": 0.1,
-            "reg_lambda": 1.0,
-            "cv_splits": 5,
-        })
-        # Log metrics for each target
-        for target, m in metrics.items():
-            mlflow.log_metrics({
-                f"{target}_cv_mae_mean": m["cv_mae_mean"],
-                f"{target}_cv_mae_std": m["cv_mae_std"],
-                f"{target}_test_mae": m["test_mae"],
-                f"{target}_test_rmse": m["test_rmse"],
-                f"{target}_improvement_persistence_pct": m["improvement_over_persistence_pct"],
-                f"{target}_improvement_calendar_pct": m["improvement_over_calendar_pct"],
+    try:
+        mlflow.set_tracking_uri(os.environ.get("MLFLOW_TRACKING_URI", "http://localhost:5000"))
+        mlflow.set_experiment("demand-forecasting")
+        with mlflow.start_run(run_name="demand-xgboost"):
+            mlflow.log_params({
+                "n_estimators": 300,
+                "max_depth": 5,
+                "learning_rate": 0.05,
+                "subsample": 0.8,
+                "colsample_bytree": 0.8,
+                "min_child_weight": 5,
+                "reg_alpha": 0.1,
+                "reg_lambda": 1.0,
+                "cv_splits": 5,
             })
-        # Log model artifacts
-        mlflow.log_artifact(str(artifacts / "demand_model.pkl"))
-        mlflow.log_artifact(str(artifacts / "demand_metrics.json"))
+            for target, m in metrics.items():
+                mlflow.log_metrics({
+                    f"{target}_cv_mae_mean": m["cv_mae_mean"],
+                    f"{target}_cv_mae_std": m["cv_mae_std"],
+                    f"{target}_test_mae": m["test_mae"],
+                    f"{target}_test_rmse": m["test_rmse"],
+                    f"{target}_improvement_persistence_pct": m["improvement_over_persistence_pct"],
+                    f"{target}_improvement_calendar_pct": m["improvement_over_calendar_pct"],
+                })
+            mlflow.log_artifact(str(artifacts / "demand_model.pkl"))
+            mlflow.log_artifact(str(artifacts / "demand_metrics.json"))
+            for target, mdl in models.items():
+                mlflow.xgboost.log_model(
+                    mdl,
+                    artifact_path=f"demand_{target}_model",
+                    registered_model_name=f"demand-{target}",
+                )
         print("MLflow: demand experiment logged.")
+    except Exception as _mlflow_err:
+        print(f"MLflow logging skipped: {_mlflow_err}")
 
     # ── Check acceptance criteria ──
     arrival_mae = metrics["arrival_count"]["test_mae"]

@@ -86,3 +86,43 @@ class SimulationResponse(BaseModel):
     no_ml_result: Optional[StrategyResult] = None  # LP optimizer + fixed assumptions (no ML)
     baseline_result: Optional[StrategyResult] = None  # FCFS + no ML
     ml_metrics: Optional[MLMetrics] = None  # ML contribution metrics
+
+
+# ── Rolling Horizon Simulation schemas ───────────────────────────────────────
+
+class EVSnapshotState(BaseModel):
+    """State of one EV at a decision point in the rolling simulation."""
+    ev_id: str
+    energy_needed_kwh: float
+    energy_delivered_kwh: float
+    remaining_kwh: float
+    ml_predicted_stay_min: float    # what ML said when this EV arrived
+    no_ml_stay_min: float           # ACN per-hour mean (what no-ML assumes)
+    actual_stay_min: float          # ground truth (what actually happens)
+    schedule_kw: list[float]        # LP output from this decision point forward (capped at 48 slots)
+
+
+class DecisionPointSnapshot(BaseModel):
+    """A snapshot of the system state at one rolling-horizon decision point."""
+    index: int
+    slot: int
+    time_offset_min: float
+    time_label: str                 # e.g. "09:30"
+    trigger_ev_id: str              # the EV whose arrival triggered this re-optimization
+    present_evs: list[EVSnapshotState]
+    ml_forecast_reserved_kwh: float # energy held back for ML-forecasted future arrivals
+    ml_forecast_windows: int        # number of future windows with predicted arrivals
+    transformer_available_kw: float # headroom = capacity - building - EVs - reserved
+
+
+class RollingSimResponse(BaseModel):
+    """Response from POST /api/v1/simulation/rolling."""
+    run_id: str
+    num_vehicles: int
+    time_step_minutes: int
+    simulation_duration_hours: float
+    transformer_capacity_kw: float
+    base_load_kw: list[float]
+    snapshots: list[DecisionPointSnapshot]
+    final_ai_ml: StrategyResult
+    ml_metrics: MLMetrics

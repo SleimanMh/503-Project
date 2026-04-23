@@ -15,10 +15,12 @@ Usage:
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import joblib
 import mlflow
+import mlflow.sklearn
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor
@@ -109,11 +111,22 @@ def train_arrivals_model(artifacts_dir: str = "artifacts/"):
     with open(artifacts / "arrivals_metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
 
-    mlflow.set_tracking_uri("")
-    mlflow.set_experiment("arrivals-prediction")
-    with mlflow.start_run(run_name="arrivals-histgbdt"):
-        mlflow.log_params({"algorithm": "HistGradientBoostingRegressor", "loss_q50": "poisson"})
-        mlflow.log_metrics({k: v for k, v in metrics.items() if isinstance(v, (int, float))})
+    try:
+        mlflow.set_tracking_uri(os.environ.get("MLFLOW_TRACKING_URI", "http://localhost:5000"))
+        mlflow.set_experiment("arrivals-prediction")
+        with mlflow.start_run(run_name="arrivals-histgbdt"):
+            mlflow.log_params({"algorithm": "HistGradientBoostingRegressor", "loss_q50": "poisson"})
+            mlflow.log_metrics({k: v for k, v in metrics.items() if isinstance(v, (int, float))})
+            for tag in ["q50", "q10", "q90"]:
+                mlflow.log_artifact(str(artifacts / f"arrivals_{tag}.joblib"))
+            mlflow.sklearn.log_model(
+                models["q50"],
+                artifact_path="arrivals_q50_model",
+                registered_model_name="arrivals-predictor",
+            )
+        print("MLflow: arrivals experiment logged.")
+    except Exception as _mlflow_err:
+        print(f"MLflow logging skipped: {_mlflow_err}")
 
     return models, metrics
 

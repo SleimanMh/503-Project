@@ -558,22 +558,103 @@ if _view == "🔌 OCPP Live Monitor":
 # ── MLflow Tracking ───────────────────────────────────────────────────────
 if _view == "📈 MLflow Tracking":
     st.header("📈 MLflow Experiment Tracking")
-    st.caption("Displays MLflow at http://localhost:5000 — compare runs, view metrics, and inspect model artifacts.")
-    _components.iframe("http://localhost:5000", height=900, scrolling=True)
+    _mlc1, _mlc2 = st.columns([1, 4])
+    with _mlc1:
+        st.link_button("🔗 Open MLflow UI", "http://localhost:5000", use_container_width=True)
+    st.divider()
+    # Pull experiments + runs via MLflow REST API
+    try:
+        _ml_base = "http://localhost:5000/api/2.0/mlflow"
+        _exps = requests.get(f"{_ml_base}/experiments/search?max_results=10", timeout=5).json()
+        _exp_list = _exps.get("experiments", [])
+        if not _exp_list:
+            st.info("No experiments found in MLflow yet.")
+        for _exp in _exp_list:
+            _eid = _exp["experiment_id"]
+            _ename = _exp["name"]
+            with st.expander(f"📁 {_ename}  (id: {_eid})", expanded=(_eid == "0" or len(_exp_list) == 1)):
+                _runs_resp = requests.post(
+                    f"{_ml_base}/runs/search",
+                    json={"experiment_ids": [_eid], "max_results": 20,
+                          "order_by": ["attribute.start_time DESC"]},
+                    timeout=5,
+                ).json()
+                _runs = _runs_resp.get("runs", [])
+                if not _runs:
+                    st.caption("No runs yet.")
+                    continue
+                _rows = []
+                for _r in _runs:
+                    _info = _r.get("info", {})
+                    _metrics = {m["key"]: round(m["value"], 4) for m in _r.get("data", {}).get("metrics", [])}
+                    _row = {
+                        "Run": _info.get("run_name") or _info.get("run_id", "")[:8],
+                        "Status": _info.get("status", ""),
+                        "Started": datetime.fromtimestamp(_info["start_time"] / 1000).strftime("%Y-%m-%d %H:%M")
+                        if "start_time" in _info else "",
+                    }
+                    _row.update(_metrics)
+                    _rows.append(_row)
+                import pandas as _pd
+                st.dataframe(_pd.DataFrame(_rows), use_container_width=True)
+    except Exception as _e:
+        st.error(f"Could not reach MLflow at http://localhost:5000 — {_e}")
     st.stop()
 
 # ── Grafana Monitoring ────────────────────────────────────────────────────
 if _view == "📡 Grafana Monitoring":
     st.header("📡 Grafana Monitoring")
-    st.caption("Displays Grafana at http://localhost:3000 — system metrics, charging KPIs, and grid health. Default login: admin / admin.")
+    _gc1, _gc2 = st.columns([1, 4])
+    with _gc1:
+        st.link_button("🔗 Open Grafana", "http://localhost:3000", use_container_width=True)
+    st.caption("Login: **admin / admin** (first time). Embedding enabled — dashboard loads below.")
+    st.divider()
     _components.iframe("http://localhost:3000", height=900, scrolling=True)
     st.stop()
 
 # ── Prometheus Metrics ────────────────────────────────────────────────────
 if _view == "🔬 Prometheus Metrics":
     st.header("🔬 Prometheus Metrics")
-    st.caption("Displays Prometheus at http://localhost:9090 — raw metric queries and target scrape status.")
-    _components.iframe("http://localhost:9090", height=900, scrolling=True)
+    _pc1, _pc2 = st.columns([1, 4])
+    with _pc1:
+        st.link_button("🔗 Open Prometheus", "http://localhost:9090", use_container_width=True)
+    st.divider()
+    _prom_base = "http://localhost:9090/api/v1"
+    # Show scrape targets
+    try:
+        _targets = requests.get(f"{_prom_base}/targets", timeout=5).json()
+        _active = _targets.get("data", {}).get("activeTargets", [])
+        st.subheader("Scrape Targets")
+        if _active:
+            import pandas as _pd
+            _trows = [{"Job": t["labels"].get("job",""), "Instance": t["labels"].get("instance",""),
+                       "Health": t["health"], "Last scrape": t.get("lastScrape","")[:19]} for t in _active]
+            st.dataframe(_pd.DataFrame(_trows), use_container_width=True)
+        else:
+            st.info("No active scrape targets.")
+    except Exception as _e:
+        st.error(f"Could not reach Prometheus — {_e}")
+        st.stop()
+    # Key metrics
+    st.subheader("Key Metrics (latest values)")
+    _prom_queries = {
+        "HTTP Requests Total": 'sum(increase(http_requests_total[5m]))',
+        "Process CPU (gateway)": 'process_cpu_seconds_total{job="gateway"}',
+        "Process Memory (gateway)": 'process_resident_memory_bytes{job="gateway"}',
+        "Up targets": 'sum(up)',
+    }
+    _mcols = st.columns(len(_prom_queries))
+    for _ci, (_label, _query) in enumerate(_prom_queries.items()):
+        try:
+            _qr = requests.get(f"{_prom_base}/query", params={"query": _query}, timeout=5).json()
+            _result = _qr.get("data", {}).get("result", [])
+            _val = float(_result[0]["value"][1]) if _result else None
+            if _val is not None:
+                _mcols[_ci].metric(_label, f"{_val:,.2f}")
+            else:
+                _mcols[_ci].metric(_label, "N/A")
+        except Exception:
+            _mcols[_ci].metric(_label, "—")
     st.stop()
 
 
@@ -678,6 +759,219 @@ if st.button("Run Simulation", type="primary", use_container_width=True):
             st.error("Cannot connect to gateway. Is the system running?")
         except Exception as e:
             st.error(f"Simulation failed: {e}")
+
+# ── Rolling Horizon Simulation ─────────────────────────────────────────────
+st.divider()
+st.subheader("🔄 Rolling Horizon Replay")
+st.caption(
+    "Replays arrivals one-by-one in real time order. At each arrival the LP re-runs with "
+    "only currently-connected EVs visible — **plus ML demand forecast** to reserve capacity "
+    "for EVs not yet connected. Shows how the schedule changes at every event."
+)
+
+_rh_col1, _rh_col2 = st.columns([1, 3])
+with _rh_col1:
+    _run_rolling = st.button("▶ Run Rolling Horizon", type="secondary", use_container_width=True)
+with _rh_col2:
+    st.info(
+        "Uses the same EVs configured above. Each step: ML forecasts future arrivals → "
+        "LP allocates power → schedule locked until next arrival.",
+        icon="ℹ️",
+    )
+
+if _run_rolling:
+    _rh_payload = {
+        "vehicles": evs,
+        "transformer_capacity_kw": transformer_kw,
+        "building_base_load_kw": building_load_kw,
+        "simulation_duration_hours": duration_hours,
+        "time_step_minutes": time_step,
+        "compare_baseline": False,
+        "chargers_section_a": ev_chargers_a,
+        "chargers_section_b": ev_chargers_b,
+        "feeder_length_m": feeder_length_m,
+    }
+    with st.spinner(f"Running rolling horizon ({len(evs)} EVs, {len(evs)} ML forecasts)..."):
+        try:
+            _rh_resp = requests.post(
+                f"{GATEWAY_URL}/api/v1/simulation/rolling", json=_rh_payload, timeout=180
+            )
+            _rh_resp.raise_for_status()
+            st.session_state["rolling_result"] = _rh_resp.json()
+        except requests.ConnectionError:
+            st.error("Cannot connect to gateway.")
+        except Exception as _e:
+            st.error(f"Rolling simulation failed: {_e}")
+
+if "rolling_result" in st.session_state:
+    _rr = st.session_state["rolling_result"]
+    _snaps = _rr.get("snapshots", [])
+    _step_min = _rr["time_step_minutes"]
+    _transformer_kw = _rr["transformer_capacity_kw"]
+    _base_load_kw = _rr.get("base_load_kw", [])
+    _rh_final = _rr.get("final_ai_ml", {})
+    _rh_ml = _rr.get("ml_metrics", {})
+
+    if not _snaps:
+        st.warning("No decision points captured — check that EVs have staggered arrivals.")
+    else:
+        # ── Summary KPIs ──────────────────────────────────────────────────
+        _rh_sat = _rh_final.get("overall_satisfaction_pct", 0)
+        _rh_peak = _rh_final.get("peak_load_kw", 0)
+        _rh_kwh = _rh_final.get("total_energy_delivered_kwh", 0)
+        _rh_reserved = _rh_ml.get("capacity_reserved_kwh", 0)
+
+        _kc1, _kc2, _kc3, _kc4 = st.columns(4)
+        _kc1.metric("Overall Satisfaction", f"{_rh_sat:.1f}%")
+        _kc2.metric("Peak Load", f"{_rh_peak:.1f} kW")
+        _kc3.metric("Total Energy Delivered", f"{_rh_kwh:.1f} kWh")
+        _kc4.metric("Max ML-Reserved Capacity",
+                    f"{_rh_reserved:.1f} kWh",
+                    help="Peak capacity reserved for ML-forecast future arrivals across all events")
+
+        # ── EV Presence Timeline ──────────────────────────────────────────
+        st.markdown("**EV Presence & Charging Timeline** (actual departures)")
+        _ev_results = {ev["ev_id"]: ev for ev in _rh_final.get("ev_results", [])}
+        _fig_timeline = go.Figure()
+        _all_ev_ids_rh = sorted(_ev_results.keys())
+        for _ev_id in _all_ev_ids_rh:
+            _sched = _ev_results[_ev_id].get("power_schedule_kw", [])
+            _times = [k * _step_min for k, p in enumerate(_sched) if p > 0]
+            _powers = [p for p in _sched if p > 0]
+            if _times:
+                _fig_timeline.add_trace(go.Bar(
+                    x=_times, y=_powers,
+                    name=_ev_id,
+                    hovertemplate=f"{_ev_id}<br>T+%{{x}}min: %{{y:.1f}} kW<extra></extra>",
+                ))
+        _fig_timeline.update_layout(
+            barmode="stack",
+            xaxis_title="Minutes from simulation start",
+            yaxis_title="kW",
+            height=280,
+            margin=dict(t=20, b=40),
+            showlegend=True,
+            legend=dict(orientation="h", y=-0.25),
+        )
+        st.plotly_chart(_fig_timeline, use_container_width=True)
+
+        # ── Step-through Decision Points ──────────────────────────────────
+        st.markdown("**Step Through Decision Points**")
+        _snap_labels = [
+            f"#{s['index'] + 1}  T+{s['time_offset_min']:.0f}min ({s['time_label']})  — {s['trigger_ev_id']} arrived  |  {len(s['present_evs'])} EV(s) connected"
+            for s in _snaps
+        ]
+        _selected_snap_label = st.select_slider(
+            "Decision point", options=_snap_labels, label_visibility="collapsed"
+        )
+        _snap_idx = _snap_labels.index(_selected_snap_label)
+        _snap = _snaps[_snap_idx]
+
+        # Decision point info card
+        _dc1, _dc2, _dc3 = st.columns(3)
+        _dc1.metric("Simulation Time", f"T+{_snap['time_offset_min']:.0f} min  ({_snap['time_label']})")
+        _dc2.metric("Connected EVs", len(_snap["present_evs"]))
+        _dc3.metric("Transformer Headroom", f"{_snap['transformer_available_kw']:.1f} kW")
+
+        _ml_dc1, _ml_dc2 = st.columns(2)
+        _ml_dc1.metric(
+            "ML Forecast Windows",
+            _snap["ml_forecast_windows"],
+            help="Future time windows where ML predicted more arrivals at this decision point",
+        )
+        _ml_dc2.metric(
+            "ML Reserved Capacity",
+            f"{_snap['ml_forecast_reserved_kwh']:.1f} kWh",
+            delta="held back from current EVs" if _snap["ml_forecast_reserved_kwh"] > 0 else None,
+            delta_color="off",
+            help="Energy LP withheld from current EVs to ensure future predicted arrivals get power",
+        )
+
+        # Per-EV schedule from this decision point
+        st.markdown(f"**LP Schedule from this decision point forward** — {_snap['trigger_ev_id']} just arrived")
+        _fig_dp = go.Figure()
+        _ev_colors = [
+            "#2ecc71", "#3498db", "#e74c3c", "#f39c12", "#9b59b6",
+            "#1abc9c", "#e67e22", "#34495e", "#e91e63", "#00bcd4",
+        ]
+        for _ci, _ev_state in enumerate(_snap["present_evs"]):
+            _sched_kw = _ev_state.get("schedule_kw", [])
+            _slots = list(range(len(_sched_kw)))
+            _times_min = [_snap["time_offset_min"] + s * _step_min for s in _slots]
+            _fig_dp.add_trace(go.Bar(
+                x=_times_min, y=_sched_kw,
+                name=_ev_state["ev_id"],
+                marker_color=_ev_colors[_ci % len(_ev_colors)],
+                hovertemplate=(
+                    f"{_ev_state['ev_id']}<br>"
+                    f"ML predicted stay: {_ev_state['ml_predicted_stay_min']:.0f} min<br>"
+                    f"ACN baseline stay: {_ev_state['no_ml_stay_min']:.0f} min<br>"
+                    f"Actual stay: {_ev_state['actual_stay_min']:.0f} min<br>"
+                    f"Remaining: {_ev_state['remaining_kwh']:.1f} kWh<br>"
+                    f"%{{x:.0f}} min: %{{y:.2f}} kW<extra></extra>"
+                ),
+            ))
+
+        # Base load band
+        if _base_load_kw:
+            _bl_times = [_snap["time_offset_min"] + s * _step_min for s in range(min(len(_sched_kw), 48))]
+            _bl_vals = _base_load_kw[_snap["slot"]: _snap["slot"] + len(_bl_times)]
+            _fig_dp.add_trace(go.Bar(
+                x=_bl_times, y=_bl_vals,
+                name="Building load",
+                marker_color="#bdc3c7",
+                opacity=0.5,
+                hovertemplate="Building: %{y:.1f} kW<extra></extra>",
+            ))
+
+        # ML reserved capacity annotation
+        if _snap["ml_forecast_reserved_kwh"] > 0:
+            _fig_dp.add_hline(
+                y=_snap["transformer_available_kw"],
+                line_dash="dash",
+                line_color="#e74c3c",
+                annotation_text=f"Headroom after ML reservation ({_snap['ml_forecast_reserved_kwh']:.1f} kWh reserved)",
+                annotation_position="top right",
+            )
+
+        _fig_dp.add_hline(
+            y=_transformer_kw,
+            line_dash="dot",
+            line_color="#888",
+            annotation_text=f"Transformer limit ({_transformer_kw:.0f} kW)",
+            annotation_position="bottom right",
+        )
+        _fig_dp.update_layout(
+            barmode="stack",
+            xaxis_title="Simulation time (min from start)",
+            yaxis_title="kW",
+            height=340,
+            margin=dict(t=30, b=40),
+            legend=dict(orientation="h", y=-0.3),
+        )
+        st.plotly_chart(_fig_dp, use_container_width=True)
+
+        # Per-EV table for this snapshot
+        _table_rows = []
+        for _ev_state in _snap["present_evs"]:
+            _ml_err = abs(_ev_state["ml_predicted_stay_min"] - _ev_state["actual_stay_min"])
+            _acn_err = abs(_ev_state["no_ml_stay_min"] - _ev_state["actual_stay_min"])
+            _table_rows.append({
+                "EV": _ev_state["ev_id"],
+                "Remaining kWh": f"{_ev_state['remaining_kwh']:.1f}",
+                "ML stay (min)": f"{_ev_state['ml_predicted_stay_min']:.0f}",
+                "ACN mean (min)": f"{_ev_state['no_ml_stay_min']:.0f}",
+                "Actual stay (min)": f"{_ev_state['actual_stay_min']:.0f}",
+                "ML error (min)": f"{_ml_err:.0f}",
+                "ACN error (min)": f"{_acn_err:.0f}",
+                "ML better?": "✅" if _ml_err < _acn_err else "❌",
+            })
+        st.dataframe(_table_rows, use_container_width=True, hide_index=True)
+
+        st.caption(
+            "**ML better?** = ML departure prediction closer to actual than ACN per-hour mean. "
+            "Better predictions → LP allocates energy more efficiently → higher satisfaction."
+        )
 
 # ── Display Results ─────────────────────────────────────────────────────
 if "result" in st.session_state:

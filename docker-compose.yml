@@ -50,6 +50,11 @@ services:
   # ── Container 4: Monitoring (Prometheus + Grafana + MLflow) ──
   monitoring:
     build: ./monitoring
+    environment:
+      - GF_SECURITY_ALLOW_EMBEDDING=true
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      - MLFLOW_DISABLE_ALLOW_ORIGINS_CHECK=1
     ports:
       - "9090:9090"   # Prometheus
       - "3000:3000"   # Grafana

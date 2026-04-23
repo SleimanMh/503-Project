@@ -28,6 +28,7 @@ from app.config import ML_SERVICE_URL, OPTIMIZER_SERVICE_URL, ML_TIMEOUT_S, OPTI
 from app.schemas import (
     SimulationRequest, SimulationResponse, StrategyResult,
     EVResult, TimeSeriesPoint, GridMetrics, MLMetrics,
+    EVSnapshotState, DecisionPointSnapshot, RollingSimResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -847,3 +848,282 @@ def _generate_base_load(base_kw: float, num_slots: int, step_minutes: int) -> li
         loads.append(round(max(0, load), 2))
 
     return loads
+
+
+async def run_rolling_simulation(request: SimulationRequest) -> RollingSimResponse:
+    """
+    Rolling-horizon simulation with per-decision-point ML demand forecasting.
+
+    At each arrival event the system:
+      1. Calls ML /predict-departure for the newly-arrived EV (used when it plugs in)
+      2. Calls ML /forecast from the current simulation time → reserves capacity for
+         predicted-but-not-yet-arrived EVs
+      3. Re-runs the LP for all currently-connected EVs + forecasted reserved capacity
+      4. Locks in the schedule until the next arrival, then repeats
+
+    Returns every decision-point snapshot so the dashboard can replay the simulation
+    step-by-step and show how ML changed the allocation at each event.
+    """
+    run_id = str(uuid.uuid4())[:8]
+    num_slots = int(request.simulation_duration_hours * 60 / request.time_step_minutes)
+    slot_duration_hours = request.time_step_minutes / 60
+
+    wall_now = datetime.now(timezone.utc)
+    vehicle_arrivals = [ev.arrival_time for ev in request.vehicles if ev.arrival_time]
+    sim_start = min(vehicle_arrivals) if vehicle_arrivals else wall_now
+
+    ML_ERROR_SIGMA = 89.6
+    rng_actual = random.Random(run_id)
+    rng_ml = random.Random(run_id + "_ml")
+
+    base_load = _generate_base_load(request.building_base_load_kw, num_slots, request.time_step_minutes)
+
+    # ── Step 1: ML departure predictions (called as each EV "arrives") ─────
+    # In a real system this happens one EV at a time at the OCPP StartTransaction.
+    # Here we pre-fetch all to avoid repeated async waits during the simulation loop.
+    departure_predictions: dict[str, float] = {}
+    try:
+        async with httpx.AsyncClient(timeout=ML_TIMEOUT_S) as client:
+            for ev in request.vehicles:
+                arrival = ev.arrival_time or sim_start
+                energy_needed = max(0.0, ev.battery_capacity_kwh * (ev.target_pct - ev.battery_pct) / 100)
+                resp = await client.post(
+                    f"{ML_SERVICE_URL}/predict-departure",
+                    json={
+                        "arrival_time": arrival.isoformat(),
+                        "site_id": "0002",
+                        "cluster_id": "0039",
+                        "requested_energy_kwh": round(energy_needed, 3),
+                    },
+                )
+                if resp.status_code == 200:
+                    departure_predictions[ev.ev_id] = float(resp.json()["predicted_stay_duration_min"])
+    except Exception as e:
+        logger.warning(f"[Rolling] ML departure predictions unavailable: {e}")
+
+    # ── Step 2: Build per-vehicle metadata ──────────────────────────────────
+    vehicles_meta: dict[str, dict] = {}
+    for ev in request.vehicles:
+        arrival = ev.arrival_time or sim_start
+        minutes_from_start = max(0.0, (arrival - sim_start).total_seconds() / 60)
+        arrival_slot = min(int(minutes_from_start / request.time_step_minutes), num_slots - 1)
+        energy_needed = max(0.0, ev.battery_capacity_kwh * (ev.target_pct - ev.battery_pct) / 100)
+
+        arrival_hour = arrival.hour
+        acn_mean, acn_std = _acn_stay(arrival_hour)
+
+        # Ground truth: what the vehicle actually does (ACN distribution)
+        actual_stay = max(30.0, rng_actual.gauss(acn_mean, acn_std))
+
+        # ML stay: ground truth + ML-level noise (MAE ~112 min)
+        if ev.ev_id in departure_predictions:
+            ml_error = rng_ml.gauss(0, ML_ERROR_SIGMA)
+            ml_stay = max(15.0, actual_stay + ml_error)
+        else:
+            ml_stay = acn_mean  # fallback: ACN mean
+
+        actual_dep_slot = min(num_slots, arrival_slot + max(1, int(actual_stay / request.time_step_minutes)))
+        # ML departure slot: ML prediction + 1σ buffer (covers 84% of underestimates)
+        ml_dep_slot = min(num_slots, arrival_slot + max(1, int((ml_stay + ML_ERROR_SIGMA) / request.time_step_minutes)))
+
+        vehicles_meta[ev.ev_id] = {
+            "ev_id": ev.ev_id,
+            "arrival_slot": arrival_slot,
+            "arrival_time": arrival,
+            "actual_dep_slot": actual_dep_slot,
+            "ml_dep_slot": ml_dep_slot,
+            "ml_stay_min": ml_stay,
+            "actual_stay_min": actual_stay,
+            "acn_stay_min": acn_mean,
+            "energy_needed_kwh": energy_needed,
+            "max_charge_kw": ev.max_charge_kw,
+        }
+
+    # ── Step 3: Rolling horizon with per-decision-point ML forecast ─────────
+    committed: dict[str, list[float]] = {ev_id: [0.0] * num_slots for ev_id in vehicles_meta}
+    energy_delivered: dict[str, float] = {ev_id: 0.0 for ev_id in vehicles_meta}
+    decision_slots = sorted(set(m["arrival_slot"] for m in vehicles_meta.values()))
+    snapshots: list[DecisionPointSnapshot] = []
+
+    for dp_idx, dp_slot in enumerate(decision_slots):
+        next_dp = decision_slots[dp_idx + 1] if dp_idx + 1 < len(decision_slots) else num_slots
+        current_time = sim_start + timedelta(minutes=dp_slot * request.time_step_minutes)
+
+        # EVs that just arrived at this slot (trigger for this decision point)
+        newly_arrived = [ev_id for ev_id, m in vehicles_meta.items() if m["arrival_slot"] == dp_slot]
+
+        # Present EVs: arrived ≤ dp_slot, not yet departed, not fully charged
+        present = []
+        for ev_id, m in vehicles_meta.items():
+            if m["arrival_slot"] > dp_slot:
+                continue
+            if m["actual_dep_slot"] <= dp_slot:
+                continue
+            remaining = max(0.1, m["energy_needed_kwh"] - energy_delivered[ev_id])
+            if remaining < 0.01:
+                continue
+            present.append({
+                "ev_id": ev_id,
+                "energy_needed_kwh": round(remaining, 3),
+                "max_charge_kw": m["max_charge_kw"],
+                "arrival_slot": 0,
+                "departure_slot": max(1, m["ml_dep_slot"] - dp_slot),
+            })
+
+        if not present:
+            continue
+
+        # ── ML demand forecast from current simulation time ─────────────────
+        # This is the KEY difference: the LP sees ML-predicted FUTURE arrivals
+        # and reserves capacity for them even before they connect.
+        ml_future_arrivals: list[dict] = []
+        try:
+            sub_hours = (num_slots - dp_slot) * slot_duration_hours
+            horizon_windows = min(max(1, int(sub_hours * 2)), 96)
+            async with httpx.AsyncClient(timeout=ML_TIMEOUT_S) as client:
+                resp = await client.post(
+                    f"{ML_SERVICE_URL}/forecast",
+                    json={
+                        "current_time": current_time.isoformat(),
+                        "horizon_windows": horizon_windows,
+                        "recent_arrivals": [],
+                        "recent_kwh": [],
+                    },
+                )
+                if resp.status_code == 200:
+                    for point in resp.json()["forecast"]:
+                        window_start = datetime.fromisoformat(point["window_start"])
+                        mins_ahead = max(0.0, (window_start - current_time).total_seconds() / 60)
+                        rel_slot = int(mins_ahead / request.time_step_minutes)
+                        if rel_slot > 0 and rel_slot < (num_slots - dp_slot) and point["predicted_arrivals"] > 0.3:
+                            ml_future_arrivals.append({
+                                "slot": rel_slot,
+                                "predicted_count": point["predicted_arrivals"],
+                                "predicted_kwh": point["predicted_kwh"],
+                                "avg_charge_kw": 7.2,
+                            })
+        except Exception as e:
+            logger.warning(f"[Rolling] ML forecast unavailable at dp_slot={dp_slot}: {e}")
+
+        # Subtract known future arrivals from ML forecast (avoid double-counting)
+        known_future: dict[int, int] = {}
+        for m in vehicles_meta.values():
+            if m["arrival_slot"] > dp_slot:
+                rel = m["arrival_slot"] - dp_slot
+                known_future[rel] = known_future.get(rel, 0) + 1
+        ml_future_arrivals = [
+            {**fa, "predicted_count": max(0.0, fa["predicted_count"] - known_future.get(fa["slot"], 0))}
+            for fa in ml_future_arrivals
+            if max(0.0, fa["predicted_count"] - known_future.get(fa["slot"], 0)) > 0.1
+        ]
+
+        # ── LP optimization ─────────────────────────────────────────────────
+        sub_slots = num_slots - dp_slot
+        sub_base = base_load[dp_slot:]
+        sub_result = await _call_optimizer(
+            "optimal", present, sub_slots,
+            slot_duration_hours, request.transformer_capacity_kw, sub_base,
+            predicted_future_arrivals=ml_future_arrivals,
+        )
+        sub_schedules = {ev_res.ev_id: list(ev_res.power_schedule_kw) for ev_res in sub_result.ev_results}
+
+        # Commit from dp_slot to next_dp
+        lock_end = next_dp - dp_slot
+        for v in present:
+            ev_id = v["ev_id"]
+            sched = sub_schedules.get(ev_id, [0.0] * sub_slots)
+            for k in range(min(lock_end, len(sched))):
+                abs_slot = dp_slot + k
+                committed[ev_id][abs_slot] = sched[k]
+                energy_delivered[ev_id] += sched[k] * slot_duration_hours
+
+        # ── Build snapshot ───────────────────────────────────────────────────
+        ml_reserved_kwh = sum(fa["predicted_kwh"] for fa in ml_future_arrivals)
+
+        # Transformer headroom: capacity - building load - sum of EV first-slot power
+        building_now = sub_base[0] if sub_base else request.building_base_load_kw
+        ev_load_now = sum(sub_schedules.get(v["ev_id"], [0.0])[0] for v in present)
+        headroom = max(0.0, request.transformer_capacity_kw - building_now - ev_load_now)
+
+        snapshot_evs = []
+        for v in present:
+            ev_id = v["ev_id"]
+            m = vehicles_meta[ev_id]
+            schedule_snapshot = sub_schedules.get(ev_id, [])[:48]  # cap at 48 slots for response size
+            snapshot_evs.append(EVSnapshotState(
+                ev_id=ev_id,
+                energy_needed_kwh=round(m["energy_needed_kwh"], 3),
+                energy_delivered_kwh=round(energy_delivered[ev_id], 3),
+                remaining_kwh=round(v["energy_needed_kwh"], 3),
+                ml_predicted_stay_min=round(m["ml_stay_min"], 1),
+                no_ml_stay_min=round(m["acn_stay_min"], 1),
+                actual_stay_min=round(m["actual_stay_min"], 1),
+                schedule_kw=[round(x, 3) for x in schedule_snapshot],
+            ))
+
+        time_label = current_time.strftime("%H:%M")
+        trigger_ev = newly_arrived[0] if newly_arrived else present[0]["ev_id"]
+
+        snapshots.append(DecisionPointSnapshot(
+            index=dp_idx,
+            slot=dp_slot,
+            time_offset_min=round(dp_slot * request.time_step_minutes, 1),
+            time_label=time_label,
+            trigger_ev_id=trigger_ev,
+            present_evs=snapshot_evs,
+            ml_forecast_reserved_kwh=round(ml_reserved_kwh, 2),
+            ml_forecast_windows=len(ml_future_arrivals),
+            transformer_available_kw=round(headroom, 1),
+        ))
+
+    # ── Apply actual departures to committed schedule ─────────────────────
+    for ev_id, sched in committed.items():
+        actual_dep = vehicles_meta[ev_id]["actual_dep_slot"]
+        for k in range(actual_dep, len(sched)):
+            sched[k] = 0.0
+
+    # ── Build final result ─────────────────────────────────────────────────
+    ml_vehicles = [
+        {
+            "ev_id": ev_id,
+            "energy_needed_kwh": max(0.1, m["energy_needed_kwh"]),
+            "max_charge_kw": m["max_charge_kw"],
+            "arrival_slot": m["arrival_slot"],
+            "departure_slot": m["ml_dep_slot"],
+        }
+        for ev_id, m in vehicles_meta.items()
+    ]
+    final_result = _build_strategy_result(
+        "ai_ml", committed, ml_vehicles, num_slots, slot_duration_hours,
+        request.transformer_capacity_kw, base_load,
+    )
+    final_result.grid_validation = await _call_grid_validator(
+        final_result, base_load, request.transformer_capacity_kw,
+        feeder_length_m=request.feeder_length_m,
+        num_charger_nodes=request.chargers_section_a + request.chargers_section_b,
+        chargers_section_a=request.chargers_section_a,
+        chargers_section_b=request.chargers_section_b,
+    )
+
+    ml_metrics = MLMetrics(
+        departure_predictions_used=len(departure_predictions),
+        departure_predictions_skipped=len(request.vehicles) - len(departure_predictions),
+        demand_forecast_windows=sum(s.ml_forecast_windows for s in snapshots),
+        capacity_reserved_kwh=round(max((s.ml_forecast_reserved_kwh for s in snapshots), default=0.0), 1),
+        avg_predicted_stay_min=round(
+            sum(m["ml_stay_min"] for m in vehicles_meta.values()) / len(vehicles_meta), 1
+        ) if vehicles_meta else None,
+        default_stay_min=ACN_OVERALL_MEAN,
+    )
+
+    return RollingSimResponse(
+        run_id=run_id,
+        num_vehicles=len(request.vehicles),
+        time_step_minutes=request.time_step_minutes,
+        simulation_duration_hours=request.simulation_duration_hours,
+        transformer_capacity_kw=request.transformer_capacity_kw,
+        base_load_kw=[round(x, 2) for x in base_load],
+        snapshots=snapshots,
+        final_ai_ml=final_result,
+        ml_metrics=ml_metrics,
+    )

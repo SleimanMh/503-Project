@@ -15,10 +15,12 @@ Usage:
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import joblib
 import mlflow
+import mlflow.sklearn
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor
@@ -111,11 +113,22 @@ def train_energy_model(artifacts_dir: str = "artifacts/"):
     with open(artifacts / "energy_metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
 
-    mlflow.set_tracking_uri("")
-    mlflow.set_experiment("energy-prediction")
-    with mlflow.start_run(run_name="energy-histgbdt"):
-        mlflow.log_params({"algorithm": "HistGradientBoostingRegressor", "target_space": "log(kWh)"})
-        mlflow.log_metrics({k: v for k, v in metrics.items() if isinstance(v, (int, float))})
+    try:
+        mlflow.set_tracking_uri(os.environ.get("MLFLOW_TRACKING_URI", "http://localhost:5000"))
+        mlflow.set_experiment("energy-prediction")
+        with mlflow.start_run(run_name="energy-histgbdt"):
+            mlflow.log_params({"algorithm": "HistGradientBoostingRegressor", "target_space": "log(kWh)"})
+            mlflow.log_metrics({k: v for k, v in metrics.items() if isinstance(v, (int, float))})
+            for tag in ["mean", "q10", "q90"]:
+                mlflow.log_artifact(str(artifacts / f"energy{'_model' if tag == 'mean' else '_' + tag}.joblib"))
+            mlflow.sklearn.log_model(
+                models["mean"],
+                artifact_path="energy_model",
+                registered_model_name="energy-estimator",
+            )
+        print("MLflow: energy experiment logged.")
+    except Exception as _mlflow_err:
+        print(f"MLflow logging skipped: {_mlflow_err}")
 
     return models, metrics
 

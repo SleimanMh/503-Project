@@ -21,10 +21,12 @@ Usage:
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import joblib
 import mlflow
+import mlflow.sklearn
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor
@@ -152,20 +154,29 @@ def train_departure_model(artifacts_dir: str = "artifacts/"):
         json.dump(metrics, f, indent=2)
 
     # â”€â”€ MLflow â”€â”€
-    mlflow.set_tracking_uri("")
-    mlflow.set_experiment("departure-prediction")
-    with mlflow.start_run(run_name="departure-histgbdt-quantile"):
-        mlflow.log_params({
-            "algorithm": "HistGradientBoostingRegressor",
-            "loss": "quantile",
-            "quantiles": "0.10/0.50/0.90",
-            "target_space": "log(duration_min)",
-            "cold_start_mask_frac": 0.20,
-            **{k: v for k, v in HGBT_PARAMS.items() if not callable(v)},
-        })
-        mlflow.log_metrics({k: v for k, v in metrics.items() if isinstance(v, (int, float))})
-        for tag in ["q10", "q50", "q90"]:
-            mlflow.log_artifact(str(artifacts / f"departure_{tag}.joblib"))
+    try:
+        mlflow.set_tracking_uri(os.environ.get("MLFLOW_TRACKING_URI", "http://localhost:5000"))
+        mlflow.set_experiment("departure-prediction")
+        with mlflow.start_run(run_name="departure-histgbdt-quantile"):
+            mlflow.log_params({
+                "algorithm": "HistGradientBoostingRegressor",
+                "loss": "quantile",
+                "quantiles": "0.10/0.50/0.90",
+                "target_space": "log(duration_min)",
+                "cold_start_mask_frac": 0.20,
+                **{k: v for k, v in HGBT_PARAMS.items() if not callable(v)},
+            })
+            mlflow.log_metrics({k: v for k, v in metrics.items() if isinstance(v, (int, float))})
+            for tag in ["q10", "q50", "q90"]:
+                mlflow.log_artifact(str(artifacts / f"departure_{tag}.joblib"))
+            mlflow.sklearn.log_model(
+                models["q50"],
+                artifact_path="departure_q50_model",
+                registered_model_name="departure-predictor",
+            )
+        print("MLflow: departure experiment logged.")
+    except Exception as _mlflow_err:
+        print(f"MLflow logging skipped: {_mlflow_err}")
 
     print(f"Departure metrics: {artifacts}/departure_metrics.json")
     return models, metrics

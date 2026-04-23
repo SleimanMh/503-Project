@@ -130,6 +130,7 @@ def _write_ocpp_session(s: "ActiveSession", disconnect_time: datetime, meter_sto
 
 
 _active_sessions: dict[str, ActiveSession] = {}   # key = "{cp_id}:{connector_id}"
+_active_handlers: dict[str, "EVChargePointHandler"] = {}  # key = cp_id → handler instance
 _tx_counter: int = 0
 
 
@@ -249,6 +250,92 @@ async def _run_optimizer(
     return [max_kw] * min(slots_needed, num_slots) + [0.0] * max(0, num_slots - slots_needed)
 
 
+async def _reoptimize_fleet(
+    transformer_kw: float = 150.0,
+    time_step_min: int = 15,
+) -> None:
+    """
+    Re-run LP optimization for ALL currently active sessions.
+    Called on every StartTransaction and StopTransaction so transformer
+    capacity is always shared fairly across the live fleet.
+    Each connected charge point receives an updated SetChargingProfile.
+    """
+    if not _active_sessions:
+        return
+
+    now = datetime.now(timezone.utc)
+    vehicles = []
+    for session_key, s in list(_active_sessions.items()):
+        elapsed_min = (now - s.arrival_time).total_seconds() / 60
+        delivered_kwh = max(0.0, (s.last_meter_wh - s.meter_start_wh) / 1000.0)
+        remaining_kwh = max(0.1, s.energy_needed_kwh - delivered_kwh)
+        remaining_stay_min = max(float(time_step_min), s.predicted_stay_min - elapsed_min)
+        num_remaining_slots = max(1, int(remaining_stay_min / time_step_min))
+        vehicles.append({
+            "ev_id": f"{s.cp_id}_{s.connector_id}",
+            "energy_needed_kwh": remaining_kwh,
+            "max_charge_kw": 7.2,
+            "arrival_slot": 0,
+            "departure_slot": num_remaining_slots,
+            "_session_key": session_key,
+        })
+
+    if not vehicles:
+        return
+
+    num_slots = max(v["departure_slot"] for v in vehicles)
+    base_load = [30.0] * num_slots
+    optimizer_vehicles = [
+        {k: v for k, v in veh.items() if not k.startswith("_")}
+        for veh in vehicles
+    ]
+    payload = {
+        "vehicles": optimizer_vehicles,
+        "num_slots": num_slots,
+        "slot_duration_hours": time_step_min / 60.0,
+        "transformer_capacity_kw": transformer_kw,
+        "base_load_per_slot_kw": base_load,
+        "strategy": "optimal",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=OPTIMIZER_TIMEOUT_S) as client:
+            r = await client.post(f"{OPTIMIZER_SERVICE_URL}/optimize", json=payload)
+            r.raise_for_status()
+            data = r.json()
+        logger.info(f"[Fleet] Re-optimized {len(vehicles)} EV(s) across {num_slots} slots")
+    except Exception as exc:
+        logger.warning(f"[Fleet] Optimizer failed during fleet re-optimization: {exc}")
+        return
+
+    schedule_map = {
+        sched["ev_id"]: sched["power_per_slot_kw"]
+        for sched in data.get("schedules", [])
+    }
+
+    for veh in vehicles:
+        ev_id = veh["ev_id"]
+        session_key = veh["_session_key"]
+        session = _active_sessions.get(session_key)
+        if not session:
+            continue
+        new_schedule = schedule_map.get(ev_id)
+        if not new_schedule:
+            continue
+        session.schedule_kw = new_schedule
+        handler = _active_handlers.get(session.cp_id)
+        if handler:
+            asyncio.ensure_future(
+                handler._push_charging_profile(
+                    session.connector_id,
+                    session.transaction_id,
+                    new_schedule,
+                    session.predicted_stay_min,
+                )
+            )
+            logger.info(f"[Fleet] Pushed updated profile → {session.cp_id} ({len(new_schedule)} slots)")
+
+
 def _to_charging_schedule_periods(schedule_kw: list[float], time_step_min: int = 15) -> list[dict]:
     """
     Convert a kW-per-slot list to OCPP ChargingSchedulePeriod objects (in Watts).
@@ -302,20 +389,25 @@ class EVChargePointHandler(Cp16):
 
         logger.info(f"[{self.id}] StartTransaction connector={connector_id} tx={tx_id} tag={id_tag}")
 
+        # Register handler instance so fleet re-optimization can push profiles to this CP
+        _active_handlers[self.id] = self
+
         # ML predictions
         energy_kwh = await _ml_predict_energy(arrival_time)
         stay_min = await _ml_predict_departure(arrival_time, energy_kwh)
 
-        # LP optimizer
-        schedule_kw = await _run_optimizer(
-            ev_id=f"{self.id}_{connector_id}",
-            energy_kwh=energy_kwh,
-            max_kw=7.2,
-            predicted_stay_min=stay_min,
+        # Flat fallback schedule so StartTransaction response is sent immediately
+        _time_step = 15
+        _num_slots = max(1, int(stay_min / _time_step))
+        _slots_needed = max(1, int(energy_kwh / (7.2 * _time_step / 60)))
+        fallback_schedule = (
+            [7.2] * min(_slots_needed, _num_slots)
+            + [0.0] * max(0, _num_slots - _slots_needed)
         )
+
         logger.info(
-            f"[{self.id}] Schedule computed: {len(schedule_kw)} slots, "
-            f"energy={energy_kwh:.2f} kWh, stay={stay_min:.0f} min"
+            f"[{self.id}] Session registered: energy={energy_kwh:.2f} kWh, "
+            f"stay={stay_min:.0f} min — fleet re-optimization pending"
         )
 
         _active_sessions[session_key] = ActiveSession(
@@ -327,14 +419,12 @@ class EVChargePointHandler(Cp16):
             meter_start_wh=float(meter_start),
             predicted_stay_min=stay_min,
             energy_needed_kwh=energy_kwh,
-            schedule_kw=schedule_kw,
+            schedule_kw=fallback_schedule,
             last_meter_wh=float(meter_start),
         )
 
-        # Push the charging profile in a background task (small delay so response goes first)
-        asyncio.ensure_future(
-            self._push_charging_profile(connector_id, tx_id, schedule_kw, stay_min)
-        )
+        # Re-optimize ALL connected EVs together and push updated profiles to each
+        asyncio.ensure_future(_reoptimize_fleet())
 
         return call_result.StartTransaction(
             transaction_id=tx_id,
@@ -442,6 +532,13 @@ class EVChargePointHandler(Cp16):
 
             # Write full ACN-format record — this is real data for future retraining
             _write_ocpp_session(s, disconnect_time, meter_stop_wh)
+
+            # Remove handler if this CP has no more active sessions
+            if not any(sess.cp_id == self.id for sess in _active_sessions.values()):
+                _active_handlers.pop(self.id, None)
+
+            # Release freed capacity back to remaining connected EVs
+            asyncio.ensure_future(_reoptimize_fleet())
         else:
             logger.warning(f"[{self.id}] StopTransaction for unknown tx={transaction_id}")
 
